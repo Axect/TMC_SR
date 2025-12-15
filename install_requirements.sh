@@ -1,1 +1,1 @@
-uv pip install -U numpy matplotlib scienceplots
+uv pip install -U numpy matplotlib scienceplots scipy
