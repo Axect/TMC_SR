@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import scienceplots
 
 def generate_and_shift(n_events=10000, n_particles=20, T=0.25):
     """
@@ -48,11 +49,13 @@ c2_2_mean = np.mean(c2_2_evts)
 print(f"Calculated c2{{2}} (Integrated): {c2_2_mean:.5f}")
 
 # --- Visualize results (p_t distribution) ---
-plt.figure(figsize=(8, 5))
-plt.hist(p_mag.flatten(), bins=100, density=True, alpha=0.6, label='Generated (Shifted)')
-x = np.linspace(0, 2, 100)
-plt.plot(x, (1/T_val)*np.exp(-x/T_val), 'r--', label='Original Input PDF')
-plt.title(f"Transverse Momentum Distribution (N={N})")
-plt.xlabel("p [GeV]")
-plt.legend()
-plt.show()
+with plt.style.context(['science', 'nature']):
+    fig, ax = plt.subplots()
+    ax.hist(p_mag.flatten(), bins=100, density=True, alpha=0.6, label='Generated (Shifted)')
+    x = np.linspace(0, 2, 100)
+    ax.plot(x, (1/T_val)*np.exp(-x/T_val), 'r--', label='Original Input PDF')
+    ax.set_title(f"Transverse Momentum Distribution (N={N})")
+    ax.set_xlabel(r"$p$ [GeV]")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig("pt_distribution_shifted.png", dpi=300)
