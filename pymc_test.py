@@ -47,65 +47,87 @@ def calculate_exact_c2_robust(N, T=0.25):
 
 # --- 2. PyMC Simulation Model ---
 
-def run_pymc_tmc(N, T=0.25, draws=2000, tune=1000, return_momenta=False):
+def run_pymc_tmc(N, T=0.25, draws=5000, tune=2000, chains=4,
+                 target_accept=0.95, return_momenta=False, verbose=False):
     """
-    Runs the TMC simulation using PyMC.
-    
+    Runs the TMC simulation using PyMC with high-precision settings.
+
     Args:
         N (int): Number of particles.
         T (float): Temperature parameter (GeV).
-        draws (int): Number of samples to draw.
+        draws (int): Number of samples to draw per chain.
         tune (int): Number of tuning steps for NUTS sampler.
+        chains (int): Number of independent MCMC chains.
+        target_accept (float): Target acceptance rate for NUTS (higher = more precise).
         return_momenta (bool): If True, returns flat arrays of px, py for distribution check.
-        
+        verbose (bool): If True, print diagnostic information.
+
     Returns:
         np.array: Array of c2{2} values calculated for each event (if return_momenta=False).
         tuple: (px_flat, py_flat) (if return_momenta=True).
     """
     with pm.Model() as model:
         # --- A. Priors for N-1 particles ---
-        # The single particle distribution f(p) ~ exp(-p/T) in 2D 
+        # The single particle distribution f(p) ~ exp(-p/T) in 2D
         # corresponds to a Gamma(alpha=2, beta=1/T) for the magnitude p.
         p_mag_rest = pm.Gamma("p_mag_rest", alpha=2, beta=1/T, shape=N-1)
         phi_rest = pm.Uniform("phi_rest", lower=0, upper=2*np.pi, shape=N-1)
-        
+
         # Convert to Cartesian coordinates (using PyTensor)
         px_rest = p_mag_rest * pt.cos(phi_rest)
         py_rest = p_mag_rest * pt.sin(phi_rest)
-        
+
         # --- B. Enforce Momentum Conservation ---
         # The N-th particle is fully determined by the sum of the others.
         px_last = -pt.sum(px_rest)
         py_last = -pt.sum(py_rest)
-        
+
         # Calculate magnitude of the N-th particle
         p_mag_last = pt.sqrt(px_last**2 + py_last**2)
-        
+
         # --- C. Apply Physics Constraint via Potential ---
         # The N-th particle must also satisfy the Boltzmann weight exp(-p/T).
         # We add log(exp(-p/T)) = -p/T to the model's log-likelihood.
         pm.Potential("energy_constraint_nth", -p_mag_last / T)
-        
+
         # --- D. Reconstruction for Output ---
         # Concatenate (N-1) particles with the N-th particle
         # px_all shape: (N,)
         px_all = pt.concatenate([px_rest, pt.stack([px_last])])
         py_all = pt.concatenate([py_rest, pt.stack([py_last])])
-        
+
         # Deterministic variables are saved in the trace
         pm.Deterministic("px", px_all)
         pm.Deterministic("py", py_all)
-        
-        # --- E. Sampling ---
-        # Using NUTS (No-U-Turn Sampler) which is highly efficient
-        trace = pm.sample(draws=draws, tune=tune, chains=2, progressbar=False)
 
-    # --- F. Post-Processing ---
+        # --- E. Sampling with High-Precision Settings ---
+        trace = pm.sample(
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            cores=chains,  # Parallel chains
+            nuts_sampler="pymc",
+            nuts_sampler_kwargs={"target_accept": target_accept},
+            progressbar=False,
+            discard_tuned_samples=True,
+            return_inferencedata=True,
+            random_seed=42,  # Reproducibility
+        )
+
+    # --- F. Diagnostics (optional) ---
+    if verbose:
+        import arviz as az
+        summary = az.summary(trace, var_names=["p_mag_rest"])
+        print(f"  ESS bulk (min): {summary['ess_bulk'].min():.0f}")
+        print(f"  ESS tail (min): {summary['ess_tail'].min():.0f}")
+        print(f"  R-hat (max): {summary['r_hat'].max():.4f}")
+
+    # --- G. Post-Processing ---
     # Extract data from posterior
     # shape: (chains, draws, N)
     px_data = trace.posterior["px"].values
     py_data = trace.posterior["py"].values
-    
+
     # Merge chains and draws
     # shape: (total_samples, N)
     px_flat = px_data.reshape(-1, N)
@@ -116,26 +138,27 @@ def run_pymc_tmc(N, T=0.25, draws=2000, tune=1000, return_momenta=False):
 
     # Calculate Azimuthal Angles
     phi_flat = np.arctan2(py_flat, px_flat)
-    
+
     # Calculate Q-vector: Q2 = sum(e^(i*2*phi))
     Q2 = np.sum(np.exp(1j * 2 * phi_flat), axis=1)
-    
+
     # Calculate c2{2} estimator per event
     # Formula: (|Q|^2 - N) / (N(N-1))
     c2_samples = (np.abs(Q2)**2 - N) / (N * (N - 1))
-    
+
     return c2_samples
 
 
 # --- 3. Distribution Verification Function ---
 
-def check_and_plot_distribution(N=20, T=0.25, draws=2000):
+def check_and_plot_distribution(N=20, T=0.25, draws=5000, chains=4):
     """
     Runs a simulation to verify if the generated momentum distribution
     matches the theoretical Gamma distribution.
     """
     print(f"\n--- Running Distribution Check (N={N}) ---")
-    px, py = run_pymc_tmc(N, T, draws, tune=1000, return_momenta=True)
+    px, py = run_pymc_tmc(N, T, draws=draws, tune=2000, chains=chains,
+                          return_momenta=True, verbose=True)
     
     # Calculate magnitude p_T
     p_mag = np.sqrt(px**2 + py**2).flatten()
@@ -176,13 +199,16 @@ if __name__ == "__main__":
     except:
         plt.style.use('default')
 
-    # Parameters
-    N_list = [10, 20, 30, 40, 50]  # Reduced range for demonstration speed
+    # Parameters - High Precision Settings
+    N_list = [10, 20, 30, 40, 50, 60, 80, 100]  # Extended range
     T_val = 0.25
-    Draws = 3000  # Number of MCMC samples
+    Draws = 5000     # Samples per chain
+    Chains = 4       # Number of independent chains
+    Tune = 2000      # Tuning steps
+    Target_Accept = 0.95  # Higher acceptance for precision
 
     # Step 1: Verify Distribution first
-    check_and_plot_distribution(N=20, T=T_val, draws=2000)
+    check_and_plot_distribution(N=20, T=T_val, draws=Draws, chains=Chains)
 
     # Step 2: Run Main Simulation Loop
     results_sim_mean = []
@@ -194,26 +220,34 @@ if __name__ == "__main__":
     print("-" * 45)
 
     for n_particle in N_list:
-        # 1. Run PyMC Simulation
-        c2_samples = run_pymc_tmc(N=n_particle, T=T_val, draws=Draws)
-        
+        # 1. Run PyMC Simulation with high-precision settings
+        c2_samples = run_pymc_tmc(
+            N=n_particle,
+            T=T_val,
+            draws=Draws,
+            tune=Tune,
+            chains=Chains,
+            target_accept=Target_Accept,
+            verbose=True
+        )
+
         # Calculate Statistics
         # Note: c2{2} can be slightly negative due to fluctuations, so we take mean then sqrt
         mean_c2 = np.mean(c2_samples)
         err_c2_mean = np.std(c2_samples) / np.sqrt(len(c2_samples))
-        
+
         # Convert to RMS flow (sqrt(c2))
         # Propagate error: d(sqrt(x)) = dx / (2*sqrt(x))
         sim_val = np.sqrt(np.abs(mean_c2))
         sim_err = err_c2_mean / (2 * sim_val)
-        
+
         results_sim_mean.append(sim_val)
         results_sim_err.append(sim_err)
-        
+
         # 2. Exact Theory Calculation
         exact_val = np.sqrt(calculate_exact_c2_robust(n_particle, T=T_val))
         results_exact.append(exact_val)
-        
+
         print(f"{n_particle:<5} | {sim_val:.5f} +/- {sim_err:.5f} | {exact_val:.5f}")
 
 
@@ -225,9 +259,10 @@ if __name__ == "__main__":
     ax.plot(N_list, results_exact, 'r-', linewidth=2, label='Exact Analytical (Bessel)')
 
     # Plot Simulation
-    ax.errorbar(N_list, results_sim_mean, yerr=results_sim_err, 
-                fmt='ko', markersize=6, capsize=3, 
-                label='PyMC Simulation (NUTS)')
+    total_samples = Draws * Chains
+    ax.errorbar(N_list, results_sim_mean, yerr=results_sim_err,
+                fmt='ko', markersize=6, capsize=3,
+                label=f'PyMC NUTS ({total_samples} samples)')
 
     # Plot Settings
     ax.set_xlabel(r'$N$ (Multiplicity)')

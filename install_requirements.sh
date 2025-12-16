@@ -1,1 +1,1 @@
-uv pip install -U numpy matplotlib scienceplots scipy pymc
+uv pip install -U numpy matplotlib scienceplots scipy pymc nutpie arviz
