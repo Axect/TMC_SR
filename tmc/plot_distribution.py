@@ -89,14 +89,90 @@ def plot_distribution(parquet_path: str, T: float = 0.25, output: str = None):
     #plt.show()
 
 
+def plot_c2_2(parquet_path: str = "data/c2_2_results.parquet", output: str = None):
+    """
+    Plot c2{2} results with error bars and compare with theory.
+
+    Args:
+        parquet_path: Path to parquet file with N, c2_2, c2_2_err, c2_2_approx columns
+        output: Output filename (default: figs/c2_2_comparison.png)
+    """
+    df = pd.read_parquet(parquet_path)
+    N = df['N'].values
+    c2_2 = df['c2_2'].values
+    c2_2_err = df['c2_2_err'].values
+    c2_2_approx = df['c2_2_approx'].values
+
+    # Convert to sqrt for better visualization
+    # Handle negative values by taking abs before sqrt
+    sqrt_c2_2 = np.sqrt(np.abs(c2_2)) * np.sign(c2_2)
+    sqrt_c2_2_err = c2_2_err / (2 * np.sqrt(np.abs(c2_2) + 1e-10))
+    sqrt_c2_2_approx = np.sqrt(c2_2_approx)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    # Left: c2{2} with error bars
+    ax = axes[0]
+    ax.errorbar(N, c2_2, yerr=c2_2_err, fmt='ko', markersize=4, capsize=3,
+                label='Simulation')
+    ax.plot(N, c2_2_approx, 'r-', linewidth=2, label=r'Theory: $\frac{1}{2(N-2)^2}$')
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+    ax.set_xlabel(r'$N$ (Multiplicity)')
+    ax.set_ylabel(r'$c_2\{2\}$')
+    ax.set_title(r'TMC-induced $c_2\{2\}$')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Right: sqrt(c2{2}) for flow-like comparison
+    ax = axes[1]
+    ax.errorbar(N, sqrt_c2_2, yerr=sqrt_c2_2_err, fmt='ko', markersize=4, capsize=3,
+                label='Simulation')
+    ax.plot(N, sqrt_c2_2_approx, 'r-', linewidth=2, label=r'Theory')
+    ax.set_xlabel(r'$N$ (Multiplicity)')
+    ax.set_ylabel(r'$\sqrt{c_2\{2\}}$')
+    ax.set_title(r'TMC Elliptic Flow')
+    ax.set_ylim(bottom=0)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    if output is None:
+        output = "figs/c2_2_comparison.png"
+
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output, dpi=300)
+    print(f"Plot saved as {output}")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Plot momentum distribution from parquet file")
-    parser.add_argument("parquet", nargs="?", default="data/samples.parquet",
-                        help="Path to parquet file (default: data/samples.parquet)")
-    parser.add_argument("-T", "--temperature", type=float, default=0.25,
-                        help="Temperature parameter in GeV (default: 0.25)")
-    parser.add_argument("-o", "--output", type=str, default=None,
-                        help="Output filename (default: <input>_distribution.png)")
+    parser = argparse.ArgumentParser(description="Plot TMC simulation results")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # Distribution subcommand
+    dist_parser = subparsers.add_parser("dist", help="Plot momentum distribution")
+    dist_parser.add_argument("parquet", nargs="?", default="data/samples_N20.parquet",
+                             help="Path to parquet file (default: data/samples_N20.parquet)")
+    dist_parser.add_argument("-T", "--temperature", type=float, default=0.25,
+                             help="Temperature parameter in GeV (default: 0.25)")
+    dist_parser.add_argument("-o", "--output", type=str, default=None,
+                             help="Output filename")
+
+    # c2_2 subcommand
+    c2_parser = subparsers.add_parser("c2", help="Plot c2{2} results")
+    c2_parser.add_argument("parquet", nargs="?", default="data/c2_2_results.parquet",
+                           help="Path to parquet file (default: data/c2_2_results.parquet)")
+    c2_parser.add_argument("-o", "--output", type=str, default=None,
+                           help="Output filename")
 
     args = parser.parse_args()
-    plot_distribution(args.parquet, T=args.temperature, output=args.output)
+
+    if args.command == "dist":
+        plot_distribution(args.parquet, T=args.temperature, output=args.output)
+    elif args.command == "c2":
+        plot_c2_2(args.parquet, output=args.output)
+    else:
+        # Default: run both if data exists
+        if Path("data/samples_N20.parquet").exists():
+            plot_distribution("data/samples_N20.parquet")
+        if Path("data/c2_2_results.parquet").exists():
+            plot_c2_2()
