@@ -505,7 +505,7 @@ if __name__ == "__main__":
     print("="*60)
 
     # Experiment parameters
-    N_list = [10, 20, 50, 100]
+    N_list = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
     tolerance_list = [0.05, 0.1, 0.2, 0.5, 1.0]
     T_val = 0.25
     n_samples = 5000
