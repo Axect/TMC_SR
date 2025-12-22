@@ -218,7 +218,38 @@ def check_and_plot_distribution(N=20, T=0.25, draws=5000, chains=4):
     print(f"Distribution check passed. Plot saved as {filename}")
 
 
-# --- 5. Main Execution Loop ---
+# --- 5. Approximation Calculation ---
+
+def calculate_approximation_c2(N, mean_p1_sq, mean_p2_sq, T=0.25):
+    """
+    Calculates the approximate c2{2} using the large-N expansion from Phys. Rev. C 97, 014903.
+
+    The approximation is derived from Taylor expanding the Bessel function ratio I_2/I_0
+    for large arguments. Following the professor's instruction, <p1^2> and <p2^2> are
+    calculated separately from the 1st and 2nd particle.
+
+    Args:
+        N (int): Number of particles.
+        mean_p1_sq (float): <p1^2>_Omega from 1st particle (index 0).
+        mean_p2_sq (float): <p2^2>_Omega from 2nd particle (index 1).
+        T (float): Temperature parameter (GeV).
+
+    Returns:
+        float: Approximate c2{2} value.
+    """
+    # <p^2>_F: Free ensemble average (theoretical moment from Gamma(2, T))
+    # For Gamma(k=2, theta=T): <p^2> = k*(k+1)*theta^2 = 2*3*T^2 = 6*T^2
+    mean_p2_F = 6 * T**2
+
+    # Approximation formula: c2 ~ (1 / 2(N-2)^2) * (<p1^2>_Omega * <p2^2>_Omega) / <p^2>_F^2
+    coeff = 1.0 / (2.0 * (N - 2)**2)
+    ratio = (mean_p1_sq * mean_p2_sq) / (mean_p2_F**2)
+    approx_c2 = coeff * ratio
+
+    return approx_c2
+
+
+# --- 6. Main Execution Loop ---
 
 if __name__ == "__main__":
 
@@ -243,49 +274,84 @@ if __name__ == "__main__":
     results_sim_mean = []
     results_sim_err = []
     results_exact = []
+    results_approx = []
 
-    print(f"\n--- Starting NumPyro Simulation (T={T_val} GeV) ---")
-    print(f"{'N':<5} | {'Sim sqrt(c2)':<15} | {'Theory sqrt(c2)':<15}")
-    print("-" * 45)
+    print(f"\n--- Starting NumPyro Simulation with Approximation (T={T_val} GeV) ---")
+    print(f"{'N':<5} | {'Sim sqrt(c2)':<15} | {'Theory sqrt(c2)':<15} | {'Approx sqrt(c2)':<15} | {'p1/p2 ratio':<10}")
+    print("-" * 80)
 
     for n_particle in N_list:
-        # 1. Run NumPyro Simulation with high-precision settings
-        c2_samples = run_numpyro_tmc(
+        # 1. Run NumPyro Simulation (return_momenta=True to get momentum data)
+        px, py = run_numpyro_tmc(
             N=n_particle,
             T=T_val,
             draws=Draws,
             warmup=Warmup,
             chains=Chains,
             target_accept=Target_Accept,
+            return_momenta=True,
             verbose=False
         )
 
+        # --- A. Simulation c2{2} Calculation ---
+        # Calculate Azimuthal Angles
+        phi_data = np.arctan2(py, px)
+
+        # Q-vector: Q2 = sum(e^(i*2*phi))
+        Q2 = np.sum(np.exp(1j * 2 * phi_data), axis=1)
+
+        # c2{2} estimator per event
+        c2_samples = (np.abs(Q2)**2 - n_particle) / (n_particle * (n_particle - 1))
+
         # Calculate Statistics
-        # Note: c2{2} can be slightly negative due to fluctuations, so we take mean then sqrt
         mean_c2 = np.mean(c2_samples)
         err_c2_mean = np.std(c2_samples) / np.sqrt(len(c2_samples))
 
         # Convert to RMS flow (sqrt(c2))
-        # Propagate error: d(sqrt(x)) = dx / (2*sqrt(x))
         sim_val = np.sqrt(np.abs(mean_c2))
-        sim_err = err_c2_mean / (2 * sim_val)
+        sim_err = err_c2_mean / (2 * sim_val)  # Error propagation
 
         results_sim_mean.append(sim_val)
         results_sim_err.append(sim_err)
 
-        # 2. Exact Theory Calculation
+        # --- B. Approximation Calculation (p1 and p2 separately) ---
+        # Following professor's instruction: calculate <p1^2> and <p2^2> separately
+
+        # [Step 1] 1st particle (Index 0): <p1^2>_Omega
+        # px[:, 0] extracts the first particle's px for all events
+        p1_sq_samples = px[:, 0]**2 + py[:, 0]**2
+        mean_p1_sq = np.mean(p1_sq_samples)
+
+        # [Step 2] 2nd particle (Index 1): <p2^2>_Omega
+        # px[:, 1] extracts the second particle's px for all events
+        p2_sq_samples = px[:, 1]**2 + py[:, 1]**2
+        mean_p2_sq = np.mean(p2_sq_samples)
+
+        # [Debug] Check particle symmetry - these should be nearly equal
+        # If significantly different, MCMC may not have converged properly
+        symmetry_ratio = mean_p1_sq / mean_p2_sq
+
+        # Calculate approximation using separate p1 and p2
+        approx_c2 = calculate_approximation_c2(n_particle, mean_p1_sq, mean_p2_sq, T=T_val)
+        approx_val = np.sqrt(approx_c2)
+        results_approx.append(approx_val)
+
+        # --- C. Exact Theory Calculation ---
         exact_val = np.sqrt(calculate_exact_c2_robust(n_particle, T=T_val))
         results_exact.append(exact_val)
 
-        print(f"{n_particle:<5} | {sim_val:.5f} +/- {sim_err:.5f} | {exact_val:.5f}")
+        print(f"{n_particle:<5} | {sim_val:.5f} +/- {sim_err:.5f} | {exact_val:.5f}         | {approx_val:.5f}         | {symmetry_ratio:.4f}")
 
 
-    # --- 6. Visualization of Results ---
+    # --- 7. Visualization of Results ---
 
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    # Plot Theory
+    # Plot Exact Theory
     ax.plot(N_list, results_exact, 'r-', linewidth=2, label='Exact Analytical (Bessel)')
+
+    # Plot Approximation
+    ax.plot(N_list, results_approx, 'b--', linewidth=2, label='Approximation (Large N)')
 
     # Plot Simulation
     total_samples = Draws * Chains
@@ -296,7 +362,7 @@ if __name__ == "__main__":
     # Plot Settings
     ax.set_xlabel(r'$N$ (Multiplicity)')
     ax.set_ylabel(r'$\sqrt{c_2\{2\}}$')
-    ax.set_title(r'TMC Elliptic Flow: NumPyro vs Exact Theory')
+    ax.set_title(r'TMC Elliptic Flow: NumPyro vs Theory vs Approximation')
     ax.legend()
     ax.set_ylim(bottom=0)
     ax.grid(True, alpha=0.2)
