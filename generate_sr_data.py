@@ -14,9 +14,12 @@ Usage:
     python generate_sr_data.py
 """
 
+import gc
 import numpy as np
 import pandas as pd
 from pathlib import Path
+
+import jax
 
 # Import simulation functions from numpyro_test
 from numpyro_test import run_numpyro_tmc
@@ -38,10 +41,11 @@ T_VALUES = [0.15, 0.20, 0.25, 0.30, 0.35]
 N_RANGE = range(20, 102, 2)  # N=20-100, step=2
 
 # MCMC settings
-DRAWS = 8000                    # Samples per chain
-WARMUP = 2000                   # Warmup steps
-CHAINS = 1                      # Single chain (memory constrained)
+DRAWS = 6000                    # Samples per chain
+WARMUP = 3000                   # Warmup steps
+CHAINS = 16                     # Parallel chains
 TARGET_ACCEPT = 0.95            # NUTS acceptance rate
+SAVE_EVERY = 5                  # Save checkpoint every N runs
 
 # Output
 OUTPUT_DIR = Path("data")
@@ -256,6 +260,12 @@ def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float) ->
 # Main Execution
 # =============================================================================
 
+def clear_memory():
+    """Clear JAX caches and run garbage collection."""
+    jax.clear_caches()
+    gc.collect()
+
+
 def main():
     """Generate SR training data for all T and N combinations."""
     print("=" * 70)
@@ -267,11 +277,29 @@ def main():
     print(f"pT bins: {PT_BINS} -> {BIN_LABELS}")
     print(f"Samples per (T,N): {DRAWS} draws x {CHAINS} chains = {DRAWS * CHAINS}")
     print(f"Output: {OUTPUT_PATH}")
+    print(f"Checkpoint every: {SAVE_EVERY} runs")
     print("-" * 70)
 
-    total_runs = len(T_VALUES) * len(N_RANGE)
+    # Checkpoint file
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = OUTPUT_DIR / "sr_checkpoint.csv"
+
+    # Check for existing checkpoint (resume capability)
+    completed_keys = set()
     results = []
+    if checkpoint_path.exists():
+        print(f"\nResuming from checkpoint: {checkpoint_path}")
+        df_checkpoint = pd.read_csv(checkpoint_path)
+        results = df_checkpoint.to_dict('records')
+        # Track completed (T, N) pairs
+        for row in results:
+            completed_keys.add((row['T'], row['N']))
+        print(f"  Loaded {len(results)} existing data points")
+        print(f"  Completed (T, N) pairs: {len(completed_keys)}")
+
+    total_runs = len(T_VALUES) * len(N_RANGE)
     run_idx = 0
+    runs_since_save = 0
 
     for T in T_VALUES:
         print(f"\n[T = {T:.2f} GeV]")
@@ -279,6 +307,12 @@ def main():
         for N in N_RANGE:
             run_idx += 1
             progress = f"[{run_idx}/{total_runs}]"
+
+            # Skip if already completed
+            if (T, N) in completed_keys:
+                print(f"  {progress} N = {N}... (skipped, already done)")
+                continue
+
             print(f"  {progress} N = {N}...", end=" ", flush=True)
 
             # Run NumPyro simulation
@@ -291,14 +325,30 @@ def main():
             # Extract binned features
             binned_features = extract_binned_features(px, py, N, T)
             results.extend(binned_features)
+            runs_since_save += 1
 
             n_combos = len(binned_features)
             print(f"{n_combos} bin combos")
 
-    # Create DataFrame and save
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            # Clear memory after each run
+            del px, py
+            clear_memory()
+
+            # Periodic checkpoint save
+            if runs_since_save >= SAVE_EVERY:
+                df_temp = pd.DataFrame(results)
+                df_temp.to_csv(checkpoint_path, index=False)
+                print(f"    [Checkpoint saved: {len(results)} points]")
+                runs_since_save = 0
+
+    # Final save
     df = pd.DataFrame(results)
     df.to_csv(OUTPUT_PATH, index=False)
+
+    # Remove checkpoint after successful completion
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print("\n[Checkpoint removed after successful completion]")
 
     print("\n" + "-" * 70)
     print(f"Saved {len(results)} data points to {OUTPUT_PATH}")
