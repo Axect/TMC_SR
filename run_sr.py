@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """
 Symbolic Regression for TMC c2{2} using PySR.
-Discovers physics formula from simulation data.
+Discovers physics formula from binned simulation data.
+
+Data structure:
+    Each row = (N, bin_i, bin_j) combination
+    p1 quantities = averages over particles in bin_i
+    p2 quantities = averages over particles in bin_j
 
 Usage:
-    python run_sr.py
+    python run_sr.py           # Default data
+    python run_sr.py --high    # High-N data (N=50-100)
 
 Requirements:
     pip install pysr pandas
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from pysr import PySRRegressor
+
+# Import bin configuration
+from analyze_momentum_bins import PT_BINS, BIN_LABELS
 
 # Plotting style
 try:
@@ -27,7 +37,7 @@ except ImportError:
 # Configuration
 # =============================================================================
 
-DATA_PATH = Path("data/sr_training_data.csv")
+DATA_DIR = Path("data")
 OUTPUT_DIR = Path("figs")
 EQUATIONS_FILE = Path("sr_equations.csv")
 
@@ -36,7 +46,7 @@ EQUATIONS_FILE = Path("sr_equations.csv")
 # PySR Model Configuration
 # =============================================================================
 
-def create_pysr_model() -> PySRRegressor:
+def create_pysr_model(niterations: int = 100, timeout: int = 3600) -> PySRRegressor:
     """
     Create PySR model with physics-appropriate configuration.
 
@@ -46,13 +56,13 @@ def create_pysr_model() -> PySRRegressor:
     """
     model = PySRRegressor(
         # --- Core search parameters ---
-        niterations=100,          # Iterations (increase for better results)
-        populations=16,           # Parallel populations
-        population_size=40,       # Individuals per population
+        niterations=niterations,
+        populations=16,
+        population_size=40,
 
         # --- Complexity control ---
-        maxsize=25,               # Maximum expression complexity
-        maxdepth=6,               # Maximum nesting depth
+        maxsize=25,
+        maxdepth=6,
 
         # --- Operators (physics-motivated) ---
         binary_operators=["+", "-", "*", "/"],
@@ -66,21 +76,21 @@ def create_pysr_model() -> PySRRegressor:
             "+": 1,
             "-": 1,
             "*": 1,
-            "/": 2,               # Slightly penalize division
-            "square": 2,
-            "inv": 2,
+            "/": 2,
+            "square": 1,
+            "inv": 1,
         },
-        complexity_of_constants=2,
+        complexity_of_constants=3,
         complexity_of_variables=1,
 
         # --- Constraints to guide search ---
         nested_constraints={
-            "inv": {"inv": 0},    # Prevent inv(inv(x))
+            "inv": {"inv": 0},
             "square": {"square": 0, "inv": 1},
         },
 
         # --- Output settings ---
-        equation_file=str(EQUATIONS_FILE),
+        temp_equation_file=str(EQUATIONS_FILE),
         progress=True,
         verbosity=1,
 
@@ -88,8 +98,12 @@ def create_pysr_model() -> PySRRegressor:
         parsimony=0.001,
         adaptive_parsimony_scaling=20.0,
 
+        # --- Integer constants only ---
+        # Disable constant optimization to keep simple integer coefficients
+        should_optimize_constants=False,
+
         # --- Early stopping ---
-        timeout_in_seconds=3600,  # 1 hour max
+        timeout_in_seconds=timeout,
 
         # --- Extra SymPy mappings ---
         extra_sympy_mappings={
@@ -100,9 +114,8 @@ def create_pysr_model() -> PySRRegressor:
         random_state=42,
         deterministic=True,
 
-        # --- Runtime ---
-        procs=0,
-        multithreading=True,
+        # --- Runtime (deterministic requires serial) ---
+        parallelism='serial',
     )
     return model
 
@@ -111,27 +124,33 @@ def create_pysr_model() -> PySRRegressor:
 # Feature Preparation
 # =============================================================================
 
-def prepare_features(df: pd.DataFrame) -> tuple:
+def prepare_features_binned(df: pd.DataFrame) -> tuple:
     """
-    Prepare feature matrix X and target y for SR.
+    Prepare feature matrix X and target y from binned data.
+
+    Features are bin-averaged momentum quantities:
+        - mean_p1_sq: <p^2> for particles in bin_i
+        - mean_p2_sq: <p^2> for particles in bin_j
+        - etc.
 
     Returns:
-        X: Feature array (n_samples, n_features)
+        X: DataFrame with features (keeps column names for PySR)
         y: Target array (n_samples,)
         weights: Sample weights (n_samples,)
         feature_names: List of feature names
     """
     # Primary features (physics-motivated)
+    # Note: 'N' is reserved in SymPy, so rename to 'Npart'
     feature_cols = [
         'N',                      # Particle multiplicity
-        'mean_p1_sq',             # <p1^2>_Omega
-        'mean_p2_sq',             # <p2^2>_Omega
+        'mean_p1_sq',             # <p^2>_bin_i
+        'mean_p2_sq',             # <p^2>_bin_j
         'mean_p2_F',              # 6*T^2 (theoretical)
-        'inv_N_minus_2',          # 1/(N-2) hint
-        'ratio',                  # (<p1^2>*<p2^2>)/<p^2>_F^2 hint
     ]
 
-    X = df[feature_cols].values
+    # Keep as DataFrame so PySR uses column names in equations
+    # Rename 'N' to 'Npart' to avoid SymPy reserved name conflict
+    X = df[feature_cols].rename(columns={'N': 'Npart'})
     y = df['c2_mean'].values
 
     # Weights: inverse variance (higher weight for more precise measurements)
@@ -141,38 +160,60 @@ def prepare_features(df: pd.DataFrame) -> tuple:
     return X, y, weights, feature_cols
 
 
+def prepare_features_inclusive(df: pd.DataFrame) -> tuple:
+    """
+    Prepare features from inclusive (pT >= cut) data.
+    """
+    feature_cols = [
+        'N',
+        'mean_p_sq',
+        'mean_p2_F',
+    ]
+
+    # Keep as DataFrame so PySR uses column names in equations
+    # Rename 'N' to 'Npart' to avoid SymPy reserved name conflict
+    X = df[feature_cols].rename(columns={'N': 'Npart'})
+    y = df['c2_mean'].values
+
+    weights = 1.0 / (df['c2_std'].values**2 + 1e-12)
+    weights = weights / np.max(weights)
+
+    return X, y, weights, feature_cols
+
+
 # =============================================================================
 # Main SR Execution
 # =============================================================================
 
-def run_symbolic_regression():
-    """Run symbolic regression and save results."""
+def run_symbolic_regression_binned(data_path: Path, output_suffix: str = ""):
+    """Run symbolic regression on binned data."""
     print("=" * 70)
-    print("Symbolic Regression for TMC c2{2}")
+    print("Symbolic Regression for TMC c2{2} (Binned Data)")
     print("=" * 70)
 
     # Load data
-    if not DATA_PATH.exists():
-        print(f"ERROR: Data file not found: {DATA_PATH}")
+    if not data_path.exists():
+        print(f"ERROR: Data file not found: {data_path}")
         print("Please run 'python generate_sr_data.py' first.")
         return None, None
 
-    df = pd.read_csv(DATA_PATH)
-    print(f"Loaded {len(df)} data points from {DATA_PATH}")
+    df = pd.read_csv(data_path)
+    print(f"Loaded {len(df)} data points from {data_path}")
+    print(f"Bin combinations: {df[['bin_i', 'bin_j']].drop_duplicates().values.tolist()}")
 
     # Prepare features
-    X, y, weights, feature_names = prepare_features(df)
+    X, y, weights, feature_names = prepare_features_binned(df)
     print(f"\nFeatures: {feature_names}")
     print(f"Target: c2_mean (range: [{y.min():.6f}, {y.max():.6f}])")
 
     # Create and fit model
     model = create_pysr_model()
-    model.feature_names = feature_names
 
     print("\n" + "=" * 70)
     print("Starting PySR search...")
     print("=" * 70)
 
+    # Pass DataFrame directly so PySR uses column names in equations
     model.fit(X, y, weights=weights)
 
     # Display results
@@ -190,21 +231,175 @@ def run_symbolic_regression():
 
     # Save equations
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_file = OUTPUT_DIR / f"sr_pareto_front_binned{output_suffix}.csv"
     if hasattr(model, 'equations_') and model.equations_ is not None:
-        model.equations_.to_csv(OUTPUT_DIR / "sr_pareto_front.csv", index=False)
-        print(f"\nPareto front saved to {OUTPUT_DIR / 'sr_pareto_front.csv'}")
+        model.equations_.to_csv(output_file, index=False)
+        print(f"\nPareto front saved to {output_file}")
 
-    return model, df
+    return model, df, output_suffix
 
 
-def plot_results(model: PySRRegressor, df: pd.DataFrame):
-    """Create visualization comparing SR prediction vs simulation."""
+def run_symbolic_regression_inclusive(data_path: Path, output_suffix: str = ""):
+    """Run symbolic regression on inclusive data."""
+    print("=" * 70)
+    print("Symbolic Regression for TMC c2{2} (Inclusive Data)")
+    print("=" * 70)
+
+    if not data_path.exists():
+        print(f"ERROR: Data file not found: {data_path}")
+        return None, None, output_suffix
+
+    df = pd.read_csv(data_path)
+    print(f"Loaded {len(df)} data points from {data_path}")
+
+    X, y, weights, feature_names = prepare_features_inclusive(df)
+    print(f"\nFeatures: {feature_names}")
+    print(f"Target: c2_mean (range: [{y.min():.6f}, {y.max():.6f}])")
+
+    model = create_pysr_model()
+
+    print("\n" + "=" * 70)
+    print("Starting PySR search...")
+    print("=" * 70)
+
+    # Pass DataFrame directly so PySR uses column names in equations
+    model.fit(X, y, weights=weights)
+
+    print("\n" + "=" * 70)
+    print("RESULTS: Pareto Front of Equations")
+    print("=" * 70)
+    print(model)
+
+    best_eq = model.get_best()
+    print(f"\nBest equation (by score):")
+    print(f"  {best_eq['equation']}")
+    print(f"  Loss: {best_eq['loss']:.2e}")
+    print(f"  Complexity: {best_eq['complexity']}")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_file = OUTPUT_DIR / f"sr_pareto_front_inclusive{output_suffix}.csv"
+    if hasattr(model, 'equations_') and model.equations_ is not None:
+        model.equations_.to_csv(output_file, index=False)
+        print(f"\nPareto front saved to {output_file}")
+
+    return model, df, output_suffix
+
+
+# =============================================================================
+# Visualization
+# =============================================================================
+
+def plot_results_binned(model: PySRRegressor, df: pd.DataFrame, output_suffix: str = ""):
+    """Create visualization for binned SR results."""
     if model is None or df is None:
         return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    X, y, weights, feature_names = prepare_features(df)
+    X, y, weights, feature_names = prepare_features_binned(df)
+    y_pred = model.predict(X)
+
+    # Color map for bin combinations
+    bin_combos = [(bi, bj) for bi in BIN_LABELS for bj in BIN_LABELS]
+    colors = plt.cm.tab10(np.linspace(0, 1, len(bin_combos)))
+    combo_to_color = {combo: colors[i] for i, combo in enumerate(bin_combos)}
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+    # --- Left: c2 vs N for each bin combination ---
+    ax = axes[0]
+    for combo in bin_combos:
+        bin_i, bin_j = combo
+        mask = (df['bin_i'] == bin_i) & (df['bin_j'] == bin_j)
+        if mask.sum() == 0:
+            continue
+
+        N_vals = df.loc[mask, 'N'].values
+        c2_vals = df.loc[mask, 'c2_mean'].values
+        c2_pred = y_pred[mask.values]
+
+        color = combo_to_color[combo]
+        label = f'{bin_i}-{bin_j}'
+
+        # Simulation points
+        ax.scatter(N_vals, c2_vals, c=[color], s=20, alpha=0.6, marker='o')
+        # SR prediction line
+        sort_idx = np.argsort(N_vals)
+        ax.plot(N_vals[sort_idx], c2_pred[sort_idx], c=color, linewidth=1.5,
+                label=label, alpha=0.8)
+
+    ax.set_xlabel(r'$N$ (Multiplicity)')
+    ax.set_ylabel(r'$c_2\{2\}$')
+    ax.set_title('SR Prediction vs Simulation')
+    ax.legend(fontsize=7, ncol=3, loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+    # --- Middle: Parity plot (colored by bin) ---
+    ax = axes[1]
+    for combo in bin_combos:
+        bin_i, bin_j = combo
+        mask = (df['bin_i'] == bin_i) & (df['bin_j'] == bin_j)
+        if mask.sum() == 0:
+            continue
+
+        c2_sim = df.loc[mask, 'c2_mean'].values
+        c2_pred = y_pred[mask.values]
+        color = combo_to_color[combo]
+
+        ax.scatter(c2_sim, c2_pred, c=[color], s=25, alpha=0.7,
+                   label=f'{bin_i}-{bin_j}')
+
+    lims = [min(y.min(), y_pred.min()), max(y.max(), y_pred.max())]
+    ax.plot(lims, lims, 'k--', linewidth=2, label='Perfect')
+    ax.set_xlabel(r'Simulation $c_2\{2\}$')
+    ax.set_ylabel(r'SR Prediction')
+    ax.set_title('Parity Plot')
+    ax.set_aspect('equal')
+    ax.legend(fontsize=6, ncol=3)
+    ax.grid(True, alpha=0.3)
+
+    # --- Right: Residuals vs N ---
+    ax = axes[2]
+    residuals = y - y_pred
+    rel_residuals = residuals / (np.abs(y) + 1e-10) * 100
+
+    for combo in bin_combos:
+        bin_i, bin_j = combo
+        mask = (df['bin_i'] == bin_i) & (df['bin_j'] == bin_j)
+        if mask.sum() == 0:
+            continue
+
+        N_vals = df.loc[mask, 'N'].values
+        res_vals = rel_residuals[mask.values]
+        color = combo_to_color[combo]
+
+        ax.scatter(N_vals, res_vals, c=[color], s=20, alpha=0.6)
+
+    ax.axhline(0, color='black', linestyle='--', linewidth=1)
+    ax.set_xlabel(r'$N$ (Multiplicity)')
+    ax.set_ylabel(r'Relative Residual (\%)')
+    ax.set_title('Residual Analysis')
+    ax.grid(True, alpha=0.3)
+
+    # Add best equation as suptitle
+    best_eq = model.get_best()
+    fig.suptitle(f"Best: {best_eq['equation']}", fontsize=9, y=1.02)
+
+    fig.tight_layout()
+    output_path = OUTPUT_DIR / f"sr_results_binned{output_suffix}.png"
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"\nPlot saved to {output_path}")
+    plt.close(fig)
+
+
+def plot_results_inclusive(model: PySRRegressor, df: pd.DataFrame, output_suffix: str = ""):
+    """Create visualization for inclusive SR results."""
+    if model is None or df is None:
+        return
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    X, y, weights, feature_names = prepare_features_inclusive(df)
     y_pred = model.predict(X)
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -219,7 +414,7 @@ def plot_results(model: PySRRegressor, df: pd.DataFrame):
             alpha=0.7, label='Exact Theory')
     ax.set_xlabel(r'$N$ (Multiplicity)')
     ax.set_ylabel(r'$c_2\{2\}$')
-    ax.set_title('Symbolic Regression Result')
+    ax.set_title('Inclusive: SR vs Simulation')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -229,42 +424,91 @@ def plot_results(model: PySRRegressor, df: pd.DataFrame):
     lims = [min(y.min(), y_pred.min()), max(y.max(), y_pred.max())]
     ax.plot(lims, lims, 'r--', linewidth=2, label='Perfect fit')
     ax.set_xlabel(r'Simulation $c_2\{2\}$')
-    ax.set_ylabel(r'SR Prediction $c_2\{2\}$')
+    ax.set_ylabel(r'SR Prediction')
     ax.set_title('Parity Plot')
     ax.set_aspect('equal')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Add best equation as text
     best_eq = model.get_best()
     fig.suptitle(f"Best: {best_eq['equation']}", fontsize=10, y=1.02)
 
     fig.tight_layout()
-    output_path = OUTPUT_DIR / "sr_results.png"
+    output_path = OUTPUT_DIR / f"sr_results_inclusive{output_suffix}.png"
     fig.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to {output_path}")
-
     plt.close(fig)
 
 
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Run Symbolic Regression for TMC c2{2}'
+    )
+    parser.add_argument(
+        '--high', action='store_true',
+        help='Use high-N data (N=50-100, step=1)'
+    )
+    return parser.parse_args()
+
+
 def main():
-    """Main entry point."""
-    model, df = run_symbolic_regression()
+    """Main entry point - run SR on both binned and inclusive data."""
+    args = parse_args()
 
-    if model is not None:
-        plot_results(model, df)
+    # Select data files based on preset
+    suffix = "_high" if args.high else ""
+    data_path_binned = DATA_DIR / f"sr_training_data_binned{suffix}.csv"
+    data_path_inclusive = DATA_DIR / f"sr_training_data_inclusive{suffix}.csv"
 
-        # Print LaTeX form of best equation
-        print("\n" + "=" * 70)
-        print("LaTeX representation:")
-        print("=" * 70)
+    print("\n" + "=" * 70)
+    print("TMC c2{2} SYMBOLIC REGRESSION")
+    print("=" * 70)
+    print(f"Preset: {'high' if args.high else 'default'}")
+    print(f"pT bins: {PT_BINS} -> {BIN_LABELS}")
+    print(f"Data (binned): {data_path_binned}")
+    print(f"Data (inclusive): {data_path_inclusive}")
+    print("=" * 70 + "\n")
+
+    # --- Run on binned data ---
+    print("\n[1/2] Running SR on BINNED data...")
+    print("-" * 70)
+    model_binned, df_binned, _ = run_symbolic_regression_binned(data_path_binned, suffix)
+
+    if model_binned is not None:
+        plot_results_binned(model_binned, df_binned, suffix)
+
+        print("\n" + "-" * 70)
+        print("LaTeX (binned):")
         try:
-            latex = model.latex()
-            print(latex)
+            print(model_binned.latex())
         except Exception as e:
-            print(f"(LaTeX conversion not available: {e})")
+            print(f"(Not available: {e})")
 
-    return model
+    # --- Run on inclusive data ---
+    print("\n\n[2/2] Running SR on INCLUSIVE data...")
+    print("-" * 70)
+    model_inclusive, df_inclusive, _ = run_symbolic_regression_inclusive(data_path_inclusive, suffix)
+
+    if model_inclusive is not None:
+        plot_results_inclusive(model_inclusive, df_inclusive, suffix)
+
+        print("\n" + "-" * 70)
+        print("LaTeX (inclusive):")
+        try:
+            print(model_inclusive.latex())
+        except Exception as e:
+            print(f"(Not available: {e})")
+
+    print("\n" + "=" * 70)
+    print("DONE")
+    print("=" * 70)
+
+    return model_binned, model_inclusive
 
 
 if __name__ == "__main__":
