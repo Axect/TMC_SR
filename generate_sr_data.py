@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
 Generate training data for Symbolic Regression on TMC c2{2} correlation.
-Runs NumPyro simulations for N in [10, 100] and extracts physics observables
+Runs NumPyro simulations for multiple T and N values, extracts physics observables
 for each momentum bin combination.
 
 Data structure:
-    Each row = (N, bin_i, bin_j) combination
+    Each row = (T, N, bin_i, bin_j) combination
     p1 quantities = averages over particles in bin_i
     p2 quantities = averages over particles in bin_j
     c2 = two-particle correlation between bin_i and bin_j
 
 Usage:
-    python generate_sr_data.py           # Default: N=20-100, step=2
-    python generate_sr_data.py --high    # High-N: N=50-100, step=5
+    python generate_sr_data.py
 """
 
-import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
 # Import simulation functions from numpyro_test
-from numpyro_test import run_numpyro_tmc, calculate_exact_c2_robust
+from numpyro_test import run_numpyro_tmc
 
 # Import binned analysis functions
 from analyze_momentum_bins import (
@@ -33,29 +31,25 @@ from analyze_momentum_bins import (
 # Configuration
 # =============================================================================
 
-T_VAL = 0.25                    # Temperature (GeV)
+# Temperature values to scan (GeV)
+T_VALUES = [0.15, 0.20, 0.25, 0.30, 0.35]
+
+# Multiplicity range
+N_RANGE = range(20, 102, 2)  # N=20-100, step=2
+
+# MCMC settings
 DRAWS = 5000                    # Samples per chain
 WARMUP = 2500                   # Warmup steps
 CHAINS = 16                     # Parallel chains
 TARGET_ACCEPT = 0.95            # NUTS acceptance rate
 
+# Output
 OUTPUT_DIR = Path("data")
-
-# Preset configurations
-PRESETS = {
-    'default': {
-        'n_range': range(20, 102, 2),   # N=20-100, step=2
-        'suffix': '',
-    },
-    'high': {
-        'n_range': range(50, 101, 1),   # N=50-100, step=1
-        'suffix': '_high',
-    },
-}
+OUTPUT_PATH = OUTPUT_DIR / "sr_training_data.csv"
 
 
 # =============================================================================
-# Feature Extraction - Binned
+# Feature Extraction
 # =============================================================================
 
 def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float) -> list:
@@ -215,7 +209,8 @@ def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float) ->
             c2_exact = calculate_exact_c2_binned(N, T, p1_min, p1_max, p2_min, p2_max)
 
             results.append({
-                # Identifiers
+                # Identifiers (T added)
+                'T': T,
                 'N': N,
                 'bin_i': bin_i,
                 'bin_j': bin_j,
@@ -257,192 +252,81 @@ def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float) ->
     return results
 
 
-def extract_inclusive_features(px: np.ndarray, py: np.ndarray, N: int, T: float) -> dict:
-    """
-    Extract features for inclusive (all particles with pT >= cut) analysis.
-
-    Args:
-        px, py: Momentum arrays
-        N: Number of particles
-        T: Temperature
-
-    Returns:
-        Dictionary of features
-    """
-    n_samples = px.shape[0]
-
-    # Calculate pT and phi
-    pT = np.sqrt(px**2 + py**2)
-    phi = np.arctan2(py, px)
-
-    # Apply pT cut
-    mask_accepted = (pT >= PT_MIN_CUT)
-
-    # Pre-compute trig functions
-    cos2phi = np.cos(2 * phi)
-    sin2phi = np.sin(2 * phi)
-
-    # Number of accepted particles per event
-    n_acc = mask_accepted.sum(axis=1)
-
-    # Q-vector for accepted particles
-    Qc = np.where(mask_accepted, cos2phi, 0).sum(axis=1)
-    Qs = np.where(mask_accepted, sin2phi, 0).sum(axis=1)
-
-    # |Q2|^2 = Qc^2 + Qs^2
-    Q2_sq = Qc**2 + Qs**2
-
-    # c2{2} = (|Q2|^2 - n_acc) / (n_acc * (n_acc - 1))
-    n_pairs = n_acc * (n_acc - 1)
-    valid = n_pairs > 0
-
-    c2_per_event = np.full(n_samples, np.nan)
-    c2_per_event[valid] = (Q2_sq[valid] - n_acc[valid]) / n_pairs[valid]
-
-    c2_valid = c2_per_event[~np.isnan(c2_per_event)]
-    c2_mean = np.mean(c2_valid)
-    c2_std = np.std(c2_valid) / np.sqrt(len(c2_valid))
-
-    # Momentum averages for accepted particles
-    # <p>
-    sum_p = np.where(mask_accepted, pT, 0).sum(axis=1)
-    mean_p_per_event = np.zeros(n_samples)
-    mean_p_per_event[valid] = sum_p[valid] / n_acc[valid]
-    mean_p = np.mean(mean_p_per_event[valid])
-
-    # <p^2>
-    sum_p_sq = np.where(mask_accepted, pT**2, 0).sum(axis=1)
-    mean_p_sq_per_event = np.zeros(n_samples)
-    mean_p_sq_per_event[valid] = sum_p_sq[valid] / n_acc[valid]
-    mean_p_sq = np.mean(mean_p_sq_per_event[valid])
-
-    # Theoretical reference
-    mean_p2_F = 6 * T**2
-
-    # Exact theory (with pT cut)
-    c2_exact = calculate_exact_c2_binned(N, T, PT_MIN_CUT, np.inf, PT_MIN_CUT, np.inf)
-
-    return {
-        'N': N,
-        'c2_mean': c2_mean,
-        'c2_std': c2_std,
-        'c2_exact': c2_exact,
-        'mean_p': mean_p,
-        'mean_p_sq': mean_p_sq,
-        'mean_p2_F': mean_p2_F,
-        'inv_N': 1.0 / N,
-        'mean_n_accepted': np.mean(n_acc),
-        'acceptance_fraction': np.mean(n_acc) / N,
-    }
-
-
 # =============================================================================
 # Main Execution
 # =============================================================================
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description='Generate SR training data for TMC c2{2}'
-    )
-    parser.add_argument(
-        '--high', action='store_true',
-        help='Use high-N preset: N=50-100, step=1'
-    )
-    return parser.parse_args()
-
-
 def main():
-    """Generate SR training data for all multiplicities and bin combinations."""
-    args = parse_args()
-
-    # Select preset
-    preset_name = 'high' if args.high else 'default'
-    preset = PRESETS[preset_name]
-    n_range = preset['n_range']
-    suffix = preset['suffix']
-
-    # Output paths
-    output_path_binned = OUTPUT_DIR / f"sr_training_data_binned{suffix}.csv"
-    output_path_inclusive = OUTPUT_DIR / f"sr_training_data_inclusive{suffix}.csv"
-
+    """Generate SR training data for all T and N combinations."""
     print("=" * 70)
     print("Symbolic Regression Data Generation for TMC c2{2}")
     print("=" * 70)
-    print(f"Preset: {preset_name}")
-    print(f"N range: [{min(n_range)}, {max(n_range)}], step {n_range.step}")
-    print(f"Temperature: T = {T_VAL} GeV")
+    print(f"T values: {T_VALUES} GeV")
+    print(f"N range: [{min(N_RANGE)}, {max(N_RANGE)}], step {N_RANGE.step}")
     print(f"Minimum pT cut: {PT_MIN_CUT} GeV")
     print(f"pT bins: {PT_BINS} -> {BIN_LABELS}")
-    print(f"Samples per N: {DRAWS} draws x {CHAINS} chains = {DRAWS * CHAINS}")
-    print(f"Output (binned): {output_path_binned}")
-    print(f"Output (inclusive): {output_path_inclusive}")
+    print(f"Samples per (T,N): {DRAWS} draws x {CHAINS} chains = {DRAWS * CHAINS}")
+    print(f"Output: {OUTPUT_PATH}")
     print("-" * 70)
 
-    results_binned = []
-    results_inclusive = []
+    total_runs = len(T_VALUES) * len(N_RANGE)
+    results = []
+    run_idx = 0
 
-    for idx, N in enumerate(n_range):
-        progress = f"[{idx+1}/{len(n_range)}]"
-        print(f"{progress} Processing N = {N}...", end=" ", flush=True)
+    for T in T_VALUES:
+        print(f"\n[T = {T:.2f} GeV]")
 
-        # Run NumPyro simulation
-        px, py = run_numpyro_tmc(
-            N=N, T=T_VAL, draws=DRAWS, warmup=WARMUP,
-            chains=CHAINS, target_accept=TARGET_ACCEPT,
-            return_momenta=True, verbose=False
-        )
+        for N in N_RANGE:
+            run_idx += 1
+            progress = f"[{run_idx}/{total_runs}]"
+            print(f"  {progress} N = {N}...", end=" ", flush=True)
 
-        # Extract binned features
-        binned_features = extract_binned_features(px, py, N, T_VAL)
-        results_binned.extend(binned_features)
+            # Run NumPyro simulation
+            px, py = run_numpyro_tmc(
+                N=N, T=T, draws=DRAWS, warmup=WARMUP,
+                chains=CHAINS, target_accept=TARGET_ACCEPT,
+                return_momenta=True, verbose=False
+            )
 
-        # Extract inclusive features
-        inclusive_features = extract_inclusive_features(px, py, N, T_VAL)
-        results_inclusive.append(inclusive_features)
+            # Extract binned features
+            binned_features = extract_binned_features(px, py, N, T)
+            results.extend(binned_features)
 
-        # Print progress
-        c2_inc = inclusive_features['c2_mean']
-        n_combos = len(binned_features)
-        print(f"c2(incl) = {c2_inc:.6f}, {n_combos} bin combos")
+            n_combos = len(binned_features)
+            print(f"{n_combos} bin combos")
 
-    # Create DataFrames and save
+    # Create DataFrame and save
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(results)
+    df.to_csv(OUTPUT_PATH, index=False)
 
-    df_binned = pd.DataFrame(results_binned)
-    df_binned.to_csv(output_path_binned, index=False)
-
-    df_inclusive = pd.DataFrame(results_inclusive)
-    df_inclusive.to_csv(output_path_inclusive, index=False)
-
-    print("-" * 70)
-    print(f"Saved {len(results_binned)} binned data points to {output_path_binned}")
-    print(f"Saved {len(results_inclusive)} inclusive data points to {output_path_inclusive}")
+    print("\n" + "-" * 70)
+    print(f"Saved {len(results)} data points to {OUTPUT_PATH}")
 
     # Summary
     print("\n" + "=" * 70)
-    print("BINNED DATA SUMMARY")
+    print("DATA SUMMARY")
     print("=" * 70)
-    print(f"\nFeature columns ({len(df_binned.columns)}):")
-    for col in df_binned.columns:
+    print(f"\nFeature columns ({len(df.columns)}):")
+    for col in df.columns:
         print(f"  - {col}")
+
+    print("\nData by T value:")
+    for T in T_VALUES:
+        mask = df['T'] == T
+        print(f"  T={T:.2f}: {mask.sum()} rows")
 
     print("\nBin combination statistics:")
     for bin_i in BIN_LABELS:
         for bin_j in BIN_LABELS:
-            mask = (df_binned['bin_i'] == bin_i) & (df_binned['bin_j'] == bin_j)
+            mask = (df['bin_i'] == bin_i) & (df['bin_j'] == bin_j)
             count = mask.sum()
             if count > 0:
-                c2_range = df_binned.loc[mask, 'c2_mean']
+                c2_range = df.loc[mask, 'c2_mean']
                 print(f"  {bin_i}-{bin_j}: {count} points, "
                       f"c2 range [{c2_range.min():.6f}, {c2_range.max():.6f}]")
 
-    print("\n" + "=" * 70)
-    print("INCLUSIVE DATA SUMMARY")
-    print("=" * 70)
-    print(df_inclusive.describe().to_string())
-
-    return df_binned, df_inclusive
+    return df
 
 
 if __name__ == "__main__":
