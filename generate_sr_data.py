@@ -38,9 +38,9 @@ T_VALUES = [0.15, 0.20, 0.25, 0.30, 0.35]
 N_RANGE = range(20, 102, 2)  # N=20-100, step=2
 
 # MCMC settings
-DRAWS = 5000                    # Samples per chain
-WARMUP = 2500                   # Warmup steps
-CHAINS = 16                     # Parallel chains
+DRAWS = 4000                    # Samples per chain
+WARMUP = 2000                   # Warmup steps
+CHAINS = 4                      # Parallel chains (reduced for memory)
 TARGET_ACCEPT = 0.95            # NUTS acceptance rate
 
 # Output
