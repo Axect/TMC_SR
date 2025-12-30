@@ -36,6 +36,82 @@ FIG_DIR = Path("figs")
 
 
 # =============================================================================
+# Utility Functions (used by generate_sr_data.py)
+# =============================================================================
+
+def assign_bins(pT: np.ndarray, bin_edges: list) -> np.ndarray:
+    """
+    Assign particles to pT bins.
+
+    Particles below the minimum pT cut (first bin edge) are assigned bin index -1
+    and should be excluded from analysis.
+
+    Args:
+        pT: Array of shape (n_samples, N) - transverse momentum magnitudes
+        bin_edges: List of bin boundaries [0.3, 0.5, 0.8, inf]
+
+    Returns:
+        bin_indices: Array of shape (n_samples, N) with bin index (0, 1, 2)
+                     or -1 for particles below minimum pT cut
+    """
+    bin_idx = np.digitize(pT, bin_edges[1:-1])
+    bin_idx = np.where(pT < bin_edges[0], -1, bin_idx)
+    return bin_idx
+
+
+def calculate_exact_c2_binned(N: int, T: float,
+                               p1_min: float, p1_max: float,
+                               p2_min: float, p2_max: float) -> float:
+    """
+    Calculate exact c2{2} for specific momentum bin ranges using numerical integration.
+
+    The exact formula integrates the Bessel function ratio I_2/I_0 over the
+    specified momentum ranges.
+
+    Args:
+        N: Number of particles
+        T: Temperature (GeV)
+        p1_min, p1_max: Momentum range for particle 1 (bin_i)
+        p2_min, p2_max: Momentum range for particle 2 (bin_j)
+
+    Returns:
+        Exact c2{2} value for this bin combination
+    """
+    from scipy.special import i0, iv
+    from scipy.integrate import dblquad
+
+    mean_p2_F = 6 * T**2
+    coeff = 2 / ((N - 2) * mean_p2_F)
+
+    def pdf(p):
+        return (p / T**2) * np.exp(-p / T)
+
+    def numerator(p2, p1):
+        x = coeff * p1 * p2
+        return iv(2, x) * pdf(p1) * pdf(p2)
+
+    def denominator(p2, p1):
+        x = coeff * p1 * p2
+        return i0(x) * pdf(p1) * pdf(p2)
+
+    p1_upper = min(p1_max, 20 * T)
+    p2_upper = min(p2_max, 20 * T)
+    opts = {'epsabs': 1e-6, 'epsrel': 1e-6}
+
+    try:
+        num_val, _ = dblquad(numerator, p1_min, p1_upper,
+                              lambda x: p2_min, lambda x: p2_upper, **opts)
+        den_val, _ = dblquad(denominator, p1_min, p1_upper,
+                              lambda x: p2_min, lambda x: p2_upper, **opts)
+        if den_val > 0:
+            return num_val / den_val
+        else:
+            return np.nan
+    except Exception:
+        return np.nan
+
+
+# =============================================================================
 # Data Loading Functions
 # =============================================================================
 

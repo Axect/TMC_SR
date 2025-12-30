@@ -76,10 +76,10 @@ def create_pysr_model(niterations: int = 500, timeout: int = 3600) -> PySRRegres
             "-": 1,
             "*": 1,
             "/": 2,
-            "square": 1,
-            "inv": 1,
+            "square": 2,
+            "inv": 2,
         },
-        complexity_of_constants=3,
+        complexity_of_constants=2,
         complexity_of_variables=1,
 
         # --- Constraints to guide search ---
