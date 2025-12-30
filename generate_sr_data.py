@@ -38,12 +38,12 @@ from analyze_momentum_bins import (
 T_VALUES = [0.15, 0.20, 0.25, 0.30, 0.35]
 
 # Multiplicity range
-N_RANGE = range(3, 51)  # N=3-50, step=1
+N_RANGE = range(3, 101)  # N=3-50, step=1
 
 # MCMC settings
 DRAWS = 6000                    # Samples per chain
 WARMUP = 3000                   # Warmup steps
-CHAINS = 32                     # Parallel chains (for more rigorous sampling)
+CHAINS = 64                     # Parallel chains (for more rigorous sampling)
 TARGET_ACCEPT = 0.95            # NUTS acceptance rate
 SAVE_EVERY = 5                  # Save checkpoint every N runs
 THINNING = 10                   # Thinning factor (keep 1 in N samples)
