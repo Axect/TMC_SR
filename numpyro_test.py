@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 import jax
 import jax.numpy as jnp
 import numpyro
@@ -19,7 +20,9 @@ np.random.seed(RANDOM_SEED)
 
 # Force CPU backend and set up parallel chains
 jax.config.update('jax_platform_name', 'cpu')
-numpyro.set_host_device_count(16)  # Enable up to 16 parallel chains on CPU
+n_cpu = os.cpu_count()
+print(f"Detected {n_cpu} CPU cores. Setting NumPyro host device count to {n_cpu}.")
+numpyro.set_host_device_count(n_cpu)  # Enable parallel chains on all CPUs
 
 
 # --- 1. Theory Calculation (Exact) ---

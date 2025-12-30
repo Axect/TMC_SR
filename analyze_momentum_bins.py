@@ -35,6 +35,7 @@ DRAWS = 5000
 WARMUP = 2000
 CHAINS = 16
 TARGET_ACCEPT = 0.95
+THINNING = 10
 
 # Output paths
 OUTPUT_DIR = Path("data")
@@ -308,7 +309,7 @@ def calculate_exact_c2_binned(N: int, T: float,
 # =============================================================================
 
 def run_binned_analysis(N_range, T: float, pt_bins: list, bin_labels: list,
-                        draws: int, warmup: int, chains: int) -> pd.DataFrame:
+                        draws: int, warmup: int, chains: int, thinning: int = 1) -> pd.DataFrame:
     """
     Run binned c2{2} analysis for all multiplicities.
 
@@ -317,7 +318,7 @@ def run_binned_analysis(N_range, T: float, pt_bins: list, bin_labels: list,
         T: Temperature (GeV)
         pt_bins: Bin boundary list
         bin_labels: Bin label list
-        draws, warmup, chains: MCMC parameters
+        draws, warmup, chains, thinning: MCMC parameters
 
     Returns:
         DataFrame with columns: N, bin_i, bin_j, c2_mean, c2_err, n_pairs_mean, etc.
@@ -331,7 +332,8 @@ def run_binned_analysis(N_range, T: float, pt_bins: list, bin_labels: list,
         # Run MCMC
         px, py = run_numpyro_tmc(
             N=N, T=T, draws=draws, warmup=warmup, chains=chains,
-            target_accept=TARGET_ACCEPT, return_momenta=True, verbose=False
+            target_accept=TARGET_ACCEPT, thinning=thinning,
+            return_momenta=True, verbose=False
         )
 
         # Calculate phi and pT
@@ -710,7 +712,8 @@ def main():
         bin_labels=BIN_LABELS,
         draws=DRAWS,
         warmup=WARMUP,
-        chains=CHAINS
+        chains=CHAINS,
+        thinning=THINNING
     )
 
     # Add derived columns
@@ -746,7 +749,8 @@ def main():
     # pT distribution (run one quick simulation for this)
     print("  Generating pT distribution plot...")
     px, py = run_numpyro_tmc(N=50, T=T_VAL, draws=1000, warmup=500,
-                             chains=4, return_momenta=True, verbose=False)
+                             chains=4, thinning=THINNING,
+                             return_momenta=True, verbose=False)
     plot_pT_distribution(px, py, T_VAL, PT_BINS, FIG_DIR)
 
     # Print summary
