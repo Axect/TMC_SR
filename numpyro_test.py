@@ -111,7 +111,7 @@ def tmc_model(N, T):
 # --- 3. NumPyro Simulation Runner ---
 
 def run_numpyro_tmc(N, T=0.25, draws=5000, warmup=2000, chains=4,
-                    target_accept=0.95, return_momenta=False, verbose=False):
+                    target_accept=0.95, thinning=1, return_momenta=False, verbose=False):
     """
     Runs the TMC simulation using NumPyro with high-precision settings.
 
@@ -122,6 +122,7 @@ def run_numpyro_tmc(N, T=0.25, draws=5000, warmup=2000, chains=4,
         warmup (int): Number of warmup steps for NUTS sampler.
         chains (int): Number of independent MCMC chains.
         target_accept (float): Target acceptance rate for NUTS (higher = more precise).
+        thinning (int): Thinning factor to reduce autocorrelation (default: 1).
         return_momenta (bool): If True, returns flat arrays of px, py for distribution check.
         verbose (bool): If True, print diagnostic information.
 
@@ -142,6 +143,7 @@ def run_numpyro_tmc(N, T=0.25, draws=5000, warmup=2000, chains=4,
         num_warmup=warmup,
         num_samples=draws,
         num_chains=chains,
+        thinning=thinning,
         progress_bar=True,
         chain_method='parallel'  # Run chains in parallel on CPU
     )

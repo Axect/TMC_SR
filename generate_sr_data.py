@@ -46,6 +46,7 @@ WARMUP = 3000                   # Warmup steps
 CHAINS = 32                     # Parallel chains (for more rigorous sampling)
 TARGET_ACCEPT = 0.95            # NUTS acceptance rate
 SAVE_EVERY = 5                  # Save checkpoint every N runs
+THINNING = 10                   # Thinning factor (keep 1 in N samples)
 
 # Output
 OUTPUT_DIR = Path("data")
@@ -319,6 +320,7 @@ def main():
             px, py = run_numpyro_tmc(
                 N=N, T=T, draws=DRAWS, warmup=WARMUP,
                 chains=CHAINS, target_accept=TARGET_ACCEPT,
+                thinning=THINNING,
                 return_momenta=True, verbose=False
             )
 
