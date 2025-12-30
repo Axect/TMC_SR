@@ -45,7 +45,7 @@ EQUATIONS_FILE = Path("sr_equations.csv")
 # PySR Model Configuration
 # =============================================================================
 
-def create_pysr_model(niterations: int = 100, timeout: int = 3600) -> PySRRegressor:
+def create_pysr_model(niterations: int = 500, timeout: int = 3600) -> PySRRegressor:
     """
     Create PySR model with physics-appropriate configuration.
 
@@ -230,7 +230,12 @@ def run_symbolic_regression(data_path: Path) -> tuple:
 # =============================================================================
 
 def plot_results(model: PySRRegressor, df: pd.DataFrame):
-    """Create visualization for SR results."""
+    """Create visualization for SR results, organized by temperature.
+
+    Layout: n_temps rows × 2 columns
+        - Column 1: c2 vs N (simulation points + SR prediction lines)
+        - Column 2: Parity plot (simulation vs prediction)
+    """
     if model is None or df is None:
         return
 
@@ -238,95 +243,88 @@ def plot_results(model: PySRRegressor, df: pd.DataFrame):
 
     X, y, weights, feature_names = prepare_features(df)
     y_pred = model.predict(X)
+    df = df.copy()
+    df['y_pred'] = y_pred
 
-    # Get unique T values for color coding
+    # Get unique T values
     T_values = sorted(df['T'].unique())
+    n_temps = len(T_values)
 
     # Color map for bin combinations
     bin_combos = [(bi, bj) for bi in BIN_LABELS for bj in BIN_LABELS]
     colors = plt.cm.tab10(np.linspace(0, 1, len(bin_combos)))
     combo_to_color = {combo: colors[i] for i, combo in enumerate(bin_combos)}
 
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    # Create figure: n_temps rows × 2 columns
+    fig, axes = plt.subplots(n_temps, 2, figsize=(8, 3 * n_temps))
 
-    # --- Left: c2 vs N for each bin combination (all T values) ---
-    ax = axes[0]
-    for combo in bin_combos:
-        bin_i, bin_j = combo
-        mask = (df['bin_i'] == bin_i) & (df['bin_j'] == bin_j)
-        if mask.sum() == 0:
-            continue
+    # Handle single temperature case
+    if n_temps == 1:
+        axes = axes.reshape(1, -1)
 
-        N_vals = df.loc[mask, 'N'].values
-        c2_vals = df.loc[mask, 'c2_mean'].values
-        c2_pred = y_pred[mask.values]
+    for row, T in enumerate(T_values):
+        df_T = df[df['T'] == T]
 
-        color = combo_to_color[combo]
-        label = f'{bin_i}-{bin_j}'
+        # --- Left column: c2 vs N ---
+        ax = axes[row, 0]
+        for combo in bin_combos:
+            bin_i, bin_j = combo
+            mask = (df_T['bin_i'] == bin_i) & (df_T['bin_j'] == bin_j)
+            if mask.sum() == 0:
+                continue
 
-        # Simulation points
-        ax.scatter(N_vals, c2_vals, c=[color], s=20, alpha=0.6, marker='o')
-        # SR prediction line
-        sort_idx = np.argsort(N_vals)
-        ax.plot(N_vals[sort_idx], c2_pred[sort_idx], c=color, linewidth=1.5,
-                label=label, alpha=0.8)
+            N_vals = df_T.loc[mask, 'N'].values
+            c2_vals = df_T.loc[mask, 'c2_mean'].values
+            c2_pred = df_T.loc[mask, 'y_pred'].values
 
-    ax.set_xlabel(r'$N$ (Multiplicity)')
-    ax.set_ylabel(r'$c_2\{2\}$')
-    ax.set_title('SR Prediction vs Simulation')
-    ax.legend(fontsize=7, ncol=3, loc='upper right')
-    ax.grid(True, alpha=0.3)
+            color = combo_to_color[combo]
+            label = f'{bin_i}-{bin_j}' if row == 0 else None
 
-    # --- Middle: Parity plot (colored by bin) ---
-    ax = axes[1]
-    for combo in bin_combos:
-        bin_i, bin_j = combo
-        mask = (df['bin_i'] == bin_i) & (df['bin_j'] == bin_j)
-        if mask.sum() == 0:
-            continue
+            # Simulation points
+            ax.scatter(N_vals, c2_vals, c=[color], s=20, alpha=0.6, marker='o')
+            # SR prediction line
+            sort_idx = np.argsort(N_vals)
+            ax.plot(N_vals[sort_idx], c2_pred[sort_idx], c=color, linewidth=1.5,
+                    label=label, alpha=0.8)
 
-        c2_sim = df.loc[mask, 'c2_mean'].values
-        c2_pred = y_pred[mask.values]
-        color = combo_to_color[combo]
+        ax.set_xlabel(r'$N$ (Multiplicity)')
+        ax.set_ylabel(r'$c_2\{2\}$')
+        ax.set_title(f'$T = {T:.2f}$ GeV')
+        ax.grid(True, alpha=0.3)
 
-        ax.scatter(c2_sim, c2_pred, c=[color], s=25, alpha=0.7,
-                   label=f'{bin_i}-{bin_j}')
+        # Add legend only to first row
+        if row == 0:
+            ax.legend(fontsize=6, ncol=3, loc='upper right')
 
-    lims = [min(y.min(), y_pred.min()), max(y.max(), y_pred.max())]
-    ax.plot(lims, lims, 'k--', linewidth=2, label='Perfect')
-    ax.set_xlabel(r'Simulation $c_2\{2\}$')
-    ax.set_ylabel(r'SR Prediction')
-    ax.set_title('Parity Plot')
-    ax.set_aspect('equal')
-    ax.legend(fontsize=6, ncol=3)
-    ax.grid(True, alpha=0.3)
+        # --- Right column: Parity plot ---
+        ax = axes[row, 1]
+        for combo in bin_combos:
+            bin_i, bin_j = combo
+            mask = (df_T['bin_i'] == bin_i) & (df_T['bin_j'] == bin_j)
+            if mask.sum() == 0:
+                continue
 
-    # --- Right: Residuals vs N ---
-    ax = axes[2]
-    residuals = y - y_pred
-    rel_residuals = residuals / (np.abs(y) + 1e-10) * 100
+            c2_sim = df_T.loc[mask, 'c2_mean'].values
+            c2_pred = df_T.loc[mask, 'y_pred'].values
+            color = combo_to_color[combo]
 
-    for combo in bin_combos:
-        bin_i, bin_j = combo
-        mask = (df['bin_i'] == bin_i) & (df['bin_j'] == bin_j)
-        if mask.sum() == 0:
-            continue
+            ax.scatter(c2_sim, c2_pred, c=[color], s=25, alpha=0.7)
 
-        N_vals = df.loc[mask, 'N'].values
-        res_vals = rel_residuals[mask.values]
-        color = combo_to_color[combo]
+        # Perfect prediction line
+        y_T = df_T['c2_mean'].values
+        y_pred_T = df_T['y_pred'].values
+        lims = [min(y_T.min(), y_pred_T.min()), max(y_T.max(), y_pred_T.max())]
+        ax.plot(lims, lims, 'k--', linewidth=2)
 
-        ax.scatter(N_vals, res_vals, c=[color], s=20, alpha=0.6)
-
-    ax.axhline(0, color='black', linestyle='--', linewidth=1)
-    ax.set_xlabel(r'$N$ (Multiplicity)')
-    ax.set_ylabel(r'Relative Residual (\%)')
-    ax.set_title('Residual Analysis')
-    ax.grid(True, alpha=0.3)
+        ax.set_xlabel(r'Simulation $c_2\{2\}$')
+        ax.set_ylabel(r'SR Prediction')
+        ax.set_title(f'Parity ($T = {T:.2f}$ GeV)')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
 
     # Add best equation as suptitle
     best_eq = model.get_best()
-    fig.suptitle(f"Best: {best_eq['equation']}", fontsize=9, y=1.02)
+    fig.suptitle(f"Best: {best_eq['equation']}", fontsize=10, y=1.01)
 
     fig.tight_layout()
     output_path = OUTPUT_DIR / "sr_results.png"
