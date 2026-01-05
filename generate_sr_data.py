@@ -88,7 +88,7 @@ def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float) ->
     cos2phi = np.cos(2 * phi)
     sin2phi = np.sin(2 * phi)
 
-    # Theoretical reference
+    # Theoretical reference: <p^2>_F for full Boltzmann distribution
     mean_p2_F = 6 * T**2  # <p^2>_F for Gamma(2, T)
 
     # Bin edge lookup for exact theory calculation

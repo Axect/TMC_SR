@@ -68,6 +68,9 @@ def calculate_exact_c2_binned(N: int, T: float,
     The exact formula integrates the Bessel function ratio I_2/I_0 over the
     specified momentum ranges.
 
+    Note: <p²>_F = 6T² is used because the TMC constraint involves ALL N particles
+    (including those below pT_min), not just the ones we analyze.
+
     Args:
         N: Number of particles
         T: Temperature (GeV)
@@ -80,6 +83,8 @@ def calculate_exact_c2_binned(N: int, T: float,
     from scipy.special import i0, iv
     from scipy.integrate import dblquad
 
+    # <p²>_F for full Boltzmann distribution (Gamma(2,T))
+    # This is correct because TMC constraint involves ALL particles, not just analyzed ones
     mean_p2_F = 6 * T**2
     coeff = 2 / ((N - 2) * mean_p2_F)
 
