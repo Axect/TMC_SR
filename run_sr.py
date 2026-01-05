@@ -15,6 +15,7 @@ Requirements:
     pip install pysr pandas
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -23,6 +24,12 @@ from pysr import PySRRegressor
 
 # Import bin configuration
 from analyze_momentum_bins import PT_BINS, BIN_LABELS
+
+# Bin rank for weighting (high pT more accurate, low pT less accurate)
+BIN_RANK = {'low': 1, 'mid': 2, 'high': 3}
+
+# Weight schemes for SR
+WEIGHT_SCHEMES = ['none', 'variance', 'bin_rank', 'bin_rank_variance']
 
 # Plotting style
 try:
@@ -45,7 +52,7 @@ EQUATIONS_FILE = Path("sr_equations.csv")
 # PySR Model Configuration
 # =============================================================================
 
-def create_pysr_model(niterations: int = 500, timeout: int = 3600) -> PySRRegressor:
+def create_pysr_model(niterations: int = 100, timeout: int = 3600) -> PySRRegressor:
     """
     Create PySR model with physics-appropriate configuration.
 
@@ -76,8 +83,8 @@ def create_pysr_model(niterations: int = 500, timeout: int = 3600) -> PySRRegres
             "-": 1,
             "*": 1,
             "/": 2,
-            "square": 2,
-            "inv": 2,
+            "square": 3,
+            "inv": 3,
         },
         complexity_of_constants=2,
         complexity_of_variables=1,
@@ -123,7 +130,7 @@ def create_pysr_model(niterations: int = 500, timeout: int = 3600) -> PySRRegres
 # Feature Preparation
 # =============================================================================
 
-def prepare_features(df: pd.DataFrame) -> tuple:
+def prepare_features(df: pd.DataFrame, weight_scheme: str = 'bin_rank_variance') -> tuple:
     """
     Prepare feature matrix X and target y from binned data.
 
@@ -135,6 +142,10 @@ def prepare_features(df: pd.DataFrame) -> tuple:
 
     Note: T is NOT included directly as a feature since mean_p2_F = 6*T^2
           already contains the temperature information.
+
+    Args:
+        df: Input dataframe
+        weight_scheme: One of 'none', 'variance', 'bin_rank', 'bin_rank_variance'
 
     Returns:
         X: DataFrame with features (keeps column names for PySR)
@@ -156,8 +167,27 @@ def prepare_features(df: pd.DataFrame) -> tuple:
     X = df[feature_cols].rename(columns={'N': 'Npart'})
     y = df['c2_mean'].values
 
-    # Weights: inverse variance (higher weight for more precise measurements)
-    weights = 1.0 / (df['c2_std'].values**2 + 1e-12)
+    # Calculate weights based on scheme
+    if weight_scheme == 'none':
+        weights = np.ones(len(df))
+    elif weight_scheme == 'variance':
+        # Inverse variance only
+        weights = 1.0 / (df['c2_std'].values**2 + 1e-12)
+    elif weight_scheme == 'bin_rank':
+        # Bin rank only (high-high=9, low-low=1)
+        bin_i_rank = df['bin_i'].map(BIN_RANK).values
+        bin_j_rank = df['bin_j'].map(BIN_RANK).values
+        weights = bin_i_rank * bin_j_rank
+    elif weight_scheme == 'bin_rank_variance':
+        # Combine bin rank × inverse variance
+        bin_i_rank = df['bin_i'].map(BIN_RANK).values
+        bin_j_rank = df['bin_j'].map(BIN_RANK).values
+        w_bin = bin_i_rank * bin_j_rank
+        w_var = 1.0 / (df['c2_std'].values**2 + 1e-12)
+        weights = w_bin * w_var
+    else:
+        raise ValueError(f"Unknown weight_scheme: {weight_scheme}")
+
     weights = weights / np.max(weights)  # Normalize to [0, 1]
 
     return X, y, weights, feature_cols
@@ -167,28 +197,71 @@ def prepare_features(df: pd.DataFrame) -> tuple:
 # Main SR Execution
 # =============================================================================
 
-def run_symbolic_regression(data_path: Path) -> tuple:
-    """Run symbolic regression on binned data."""
+def filter_by_n_range(df: pd.DataFrame, n_range: tuple) -> pd.DataFrame:
+    """Filter dataframe by N range.
+
+    Args:
+        df: Input dataframe with 'N' column
+        n_range: Tuple of (min_N, max_N). None means no limit.
+
+    Returns:
+        Filtered dataframe
+    """
+    n_min, n_max = n_range
+    mask = pd.Series(True, index=df.index)
+    if n_min is not None:
+        mask &= (df['N'] >= n_min)
+    if n_max is not None:
+        mask &= (df['N'] <= n_max)
+    return df[mask].copy()
+
+
+def run_symbolic_regression(
+    data_path: Path,
+    n_range: tuple = None,
+    range_name: str = None,
+    weight_scheme: str = 'bin_rank_variance'
+) -> tuple:
+    """Run symbolic regression on binned data.
+
+    Args:
+        data_path: Path to training data CSV
+        n_range: Optional tuple (min_N, max_N) to filter data. None means no limit.
+        range_name: Optional name for this N range (for output naming)
+        weight_scheme: One of 'none', 'variance', 'bin_rank', 'bin_rank_variance'
+
+    Returns:
+        (model, df, range_name, weight_scheme) tuple
+    """
+    range_suffix = f" [{range_name}]" if range_name else ""
     print("=" * 70)
-    print("Symbolic Regression for TMC c2{2}")
+    print(f"Symbolic Regression for TMC c2{{2}}{range_suffix}")
+    print(f"Weight scheme: {weight_scheme}")
     print("=" * 70)
 
     # Load data
     if not data_path.exists():
         print(f"ERROR: Data file not found: {data_path}")
         print("Please run 'python generate_sr_data.py' first.")
-        return None, None
+        return None, None, None, None
 
     df = pd.read_csv(data_path)
     print(f"Loaded {len(df)} data points from {data_path}")
+
+    # Filter by N range if specified
+    if n_range is not None:
+        df = filter_by_n_range(df, n_range)
+        n_min, n_max = n_range
+        range_str = f"{n_min if n_min else ''} <= N <= {n_max if n_max else ''}"
+        print(f"Filtered to {len(df)} data points with {range_str}")
 
     # Show data summary
     T_values = df['T'].unique()
     print(f"Temperature values: {sorted(T_values)} GeV")
     print(f"Bin combinations: {df[['bin_i', 'bin_j']].drop_duplicates().values.tolist()}")
 
-    # Prepare features
-    X, y, weights, feature_names = prepare_features(df)
+    # Prepare features with specified weight scheme
+    X, y, weights, feature_names = prepare_features(df, weight_scheme=weight_scheme)
     print(f"\nFeatures: {feature_names}")
     print(f"Target: c2_mean (range: [{y.min():.6f}, {y.max():.6f}])")
 
@@ -215,26 +288,39 @@ def run_symbolic_regression(data_path: Path) -> tuple:
     print(f"  Loss: {best_eq['loss']:.2e}")
     print(f"  Complexity: {best_eq['complexity']}")
 
-    # Save equations
+    # Save equations with range and weight scheme in filename
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_file = OUTPUT_DIR / "sr_pareto_front.csv"
+    file_suffix = f"_{range_name}" if range_name else ""
+    file_suffix += f"_w{weight_scheme}"
+    output_file = OUTPUT_DIR / f"sr_pareto_front{file_suffix}.csv"
     if hasattr(model, 'equations_') and model.equations_ is not None:
         model.equations_.to_csv(output_file, index=False)
         print(f"\nPareto front saved to {output_file}")
 
-    return model, df
+    return model, df, range_name, weight_scheme
 
 
 # =============================================================================
 # Visualization
 # =============================================================================
 
-def plot_results(model: PySRRegressor, df: pd.DataFrame):
+def plot_results(
+    model: PySRRegressor,
+    df: pd.DataFrame,
+    range_name: str = None,
+    weight_scheme: str = None
+):
     """Create visualization for SR results, organized by temperature.
 
     Layout: n_temps rows × 2 columns
         - Column 1: c2 vs N (simulation points + SR prediction lines)
         - Column 2: Parity plot (simulation vs prediction)
+
+    Args:
+        model: Fitted PySR model
+        df: Data used for training
+        range_name: Optional name for N range (for output naming)
+        weight_scheme: Weight scheme used (for output naming)
     """
     if model is None or df is None:
         return
@@ -324,10 +410,14 @@ def plot_results(model: PySRRegressor, df: pd.DataFrame):
 
     # Add best equation as suptitle
     best_eq = model.get_best()
-    fig.suptitle(f"Best: {best_eq['equation']}", fontsize=10, y=1.01)
+    range_label = f" [{range_name}]" if range_name else ""
+    weight_label = f" (w={weight_scheme})" if weight_scheme else ""
+    fig.suptitle(f"Best{range_label}{weight_label}: {best_eq['equation']}", fontsize=9, y=1.01)
 
     fig.tight_layout()
-    output_path = OUTPUT_DIR / "sr_results.png"
+    file_suffix = f"_{range_name}" if range_name else ""
+    file_suffix += f"_w{weight_scheme}" if weight_scheme else ""
+    output_path = OUTPUT_DIR / f"sr_results{file_suffix}.png"
     fig.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to {output_path}")
     plt.close(fig)
@@ -337,35 +427,136 @@ def plot_results(model: PySRRegressor, df: pd.DataFrame):
 # Main Entry Point
 # =============================================================================
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Run Symbolic Regression for TMC c2{2}',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python run_sr.py --n-min 10 --n-max 50      # Custom range: 10 <= N <= 50
+  python run_sr.py --n-max 50                 # N <= 50 (no lower bound)
+  python run_sr.py --n-min 50                 # N >= 50 (no upper bound)
+  python run_sr.py                            # All data (no N filtering)
+  python run_sr.py --n-min 10 --n-max 70 --weight bin_rank  # Custom range + single weight
+
+Available weight schemes:
+  none              : No weighting (uniform)
+  variance          : 1/c2_std² (inverse variance)
+  bin_rank          : bin_i_rank × bin_j_rank (high=3, mid=2, low=1)
+  bin_rank_variance : bin_rank × inverse_variance (combined)
+  all               : Run all weight schemes (default)
+        """
+    )
+    parser.add_argument(
+        '--n-min',
+        type=int,
+        default=None,
+        help='Minimum N value (inclusive). If not specified, no lower bound.'
+    )
+    parser.add_argument(
+        '--n-max',
+        type=int,
+        default=None,
+        help='Maximum N value (inclusive). If not specified, no upper bound.'
+    )
+    parser.add_argument(
+        '--weight', '-w',
+        type=str,
+        default='all',
+        choices=WEIGHT_SCHEMES + ['all'],
+        help='Weight scheme to use (default: all)'
+    )
+    return parser.parse_args()
+
+
 def main():
     """Main entry point - run SR on binned data."""
+    args = parse_args()
+
+    # Build N range from arguments
+    n_range = (args.n_min, args.n_max)
+    has_n_filter = args.n_min is not None or args.n_max is not None
+
+    # Create range name for output files
+    if has_n_filter:
+        n_min_str = str(args.n_min) if args.n_min is not None else ""
+        n_max_str = str(args.n_max) if args.n_max is not None else ""
+        range_name = f"N{n_min_str}to{n_max_str}"
+    else:
+        range_name = "Nall"
+
+    # Determine which weight schemes to run
+    if args.weight == 'all':
+        weights_to_run = WEIGHT_SCHEMES
+    else:
+        weights_to_run = [args.weight]
+
+    # Display N range info
+    if args.n_min is not None and args.n_max is not None:
+        n_range_str = f"{args.n_min} <= N <= {args.n_max}"
+    elif args.n_min is not None:
+        n_range_str = f"N >= {args.n_min}"
+    elif args.n_max is not None:
+        n_range_str = f"N <= {args.n_max}"
+    else:
+        n_range_str = "All N (no filter)"
+
     print("\n" + "=" * 70)
     print("TMC c2{2} SYMBOLIC REGRESSION")
     print("=" * 70)
     print(f"pT bins: {PT_BINS} -> {BIN_LABELS}")
     print(f"Data: {DATA_PATH}")
+    print(f"N range: {n_range_str}")
+    print(f"Weight schemes: {weights_to_run}")
     print("=" * 70 + "\n")
 
-    # --- Run symbolic regression ---
-    print("Running SR on binned data...")
-    print("-" * 70)
-    model, df = run_symbolic_regression(DATA_PATH)
+    results = {}
 
-    if model is not None:
-        plot_results(model, df)
+    # --- Run symbolic regression for each weight scheme ---
+    total_runs = len(weights_to_run)
+    run_count = 0
 
-        print("\n" + "-" * 70)
-        print("LaTeX equation:")
-        try:
-            print(model.latex())
-        except Exception as e:
-            print(f"(Not available: {e})")
+    for weight_scheme in weights_to_run:
+        run_count += 1
+        print("\n" + "#" * 70)
+        print(f"# Run {run_count}/{total_runs}: {range_name} + weight={weight_scheme}")
+        print("#" * 70 + "\n")
+
+        model, df, _, _ = run_symbolic_regression(
+            DATA_PATH,
+            n_range=n_range if has_n_filter else None,
+            range_name=range_name,
+            weight_scheme=weight_scheme
+        )
+
+        if model is not None:
+            plot_results(model, df, range_name=range_name, weight_scheme=weight_scheme)
+
+            print("\n" + "-" * 70)
+            print(f"LaTeX equation [{range_name}, w={weight_scheme}]:")
+            try:
+                print(model.latex())
+            except Exception as e:
+                print(f"(Not available: {e})")
+
+            results[(range_name, weight_scheme)] = model
+
+    # --- Print summary ---
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    for (range_name, weight_scheme), model in results.items():
+        best_eq = model.get_best()
+        print(f"\n{range_name} (w={weight_scheme}):")
+        print(f"  Equation: {best_eq['equation']}")
+        print(f"  Loss: {best_eq['loss']:.2e}")
 
     print("\n" + "=" * 70)
     print("DONE")
     print("=" * 70)
 
-    return model
+    return results
 
 
 if __name__ == "__main__":
