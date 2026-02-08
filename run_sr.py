@@ -25,6 +25,11 @@ from pysr import PySRRegressor
 # Import bin configuration
 from analyze_momentum_bins import PT_BINS, BIN_LABELS
 
+# Post-processing: refit constants via χ² minimization
+import sympy as sp
+from scipy.optimize import curve_fit
+from fractions import Fraction
+
 # Bin rank for weighting (high pT more accurate, low pT less accurate)
 BIN_RANK = {'low': 1, 'mid': 2, 'high': 3}
 
@@ -67,7 +72,7 @@ def create_pysr_model(niterations: int = 100, timeout: int = 3600) -> PySRRegres
         population_size=40,
 
         # --- Complexity control ---
-        maxsize=25,
+        maxsize=20,
         maxdepth=6,
 
         # --- Operators (physics-motivated) ---
@@ -104,9 +109,10 @@ def create_pysr_model(niterations: int = 100, timeout: int = 3600) -> PySRRegres
         parsimony=0.001,
         adaptive_parsimony_scaling=20.0,
 
-        # --- Integer constants only ---
-        # Disable constant optimization to keep simple integer coefficients
-        should_optimize_constants=False,
+        # --- Constant handling ---
+        # Enable optimization so SR can discover shifts like (N-2).
+        # Constants are then refitted precisely via χ² post-processing.
+        should_optimize_constants=True,
 
         # --- Early stopping ---
         timeout_in_seconds=timeout,
@@ -134,14 +140,13 @@ def prepare_features(df: pd.DataFrame, weight_scheme: str = 'bin_rank_variance')
     """
     Prepare feature matrix X and target y from binned data.
 
-    Features are bin-averaged momentum quantities:
-        - Npart: Particle multiplicity (renamed from N to avoid SymPy conflict)
-        - mean_p1_sq: <p^2> for particles in bin_i
-        - mean_p2_sq: <p^2> for particles in bin_j
-        - mean_p2_F: 6*T^2 (theoretical reference, encodes temperature info)
+    Features are non-dimensionalized momentum quantities:
+        - r1: <p1²>/<p²>_F — dimensionless momentum ratio for bin_i
+        - r2: <p2²>/<p²>_F — dimensionless momentum ratio for bin_j
+        - Npart: particle multiplicity (SR must discover the N-2 shift itself)
 
-    Note: T is NOT included directly as a feature since mean_p2_F = 6*T^2
-          already contains the temperature information.
+    Non-dimensionalization ensures SR discovers formulas with integer/rational
+    constants. The target large-N formula becomes: c2 = r1·r2 / (2·(Npart-2)²).
 
     Args:
         df: Input dataframe
@@ -153,18 +158,15 @@ def prepare_features(df: pd.DataFrame, weight_scheme: str = 'bin_rank_variance')
         weights: Sample weights (n_samples,)
         feature_names: List of feature names
     """
-    # Primary features (physics-motivated)
-    # Note: 'N' is reserved in SymPy, so rename to 'Npart'
-    feature_cols = [
-        'N',                      # Particle multiplicity
-        'mean_p1_sq',             # <p^2>_bin_i
-        'mean_p2_sq',             # <p^2>_bin_j
-        'mean_p2_F',              # 6*T^2 (theoretical)
-    ]
-
-    # Keep as DataFrame so PySR uses column names in equations
-    # Rename 'N' to 'Npart' to avoid SymPy reserved name conflict
-    X = df[feature_cols].rename(columns={'N': 'Npart'})
+    # Non-dimensionalized features for clean integer/rational SR constants
+    # Dividing by <p²>_F makes momentum features dimensionless and O(1)
+    # N is kept as-is: SR must discover the (N-2) shift itself
+    X = pd.DataFrame({
+        'r1': df['mean_p1_sq'] / df['mean_p2_F'],   # <p1²>/<p²>_F (dimensionless)
+        'r2': df['mean_p2_sq'] / df['mean_p2_F'],   # <p2²>/<p²>_F (dimensionless)
+        'Npart': df['N'].astype(float),              # multiplicity (unreduced)
+    })
+    feature_names = list(X.columns)
     y = df['c2_mean'].values
 
     # Calculate weights based on scheme
@@ -190,7 +192,7 @@ def prepare_features(df: pd.DataFrame, weight_scheme: str = 'bin_rank_variance')
 
     weights = weights / np.max(weights)  # Normalize to [0, 1]
 
-    return X, y, weights, feature_cols
+    return X, y, weights, feature_names
 
 
 # =============================================================================
@@ -301,6 +303,118 @@ def run_symbolic_regression(
 
 
 # =============================================================================
+# Constant Refitting (χ² post-processing)
+# =============================================================================
+
+def refit_constants(model, df, weight_scheme='bin_rank_variance'):
+    """
+    Refit constants in PySR's best equation via χ² minimization.
+
+    Two-stage approach:
+      1. PySR discovers formula structure (with approximate float constants)
+      2. curve_fit refits constants using measurement uncertainties (c2_std)
+      3. Fraction identifies nearest simple rationals (denominator ≤ 20)
+
+    Args:
+        model: Fitted PySRRegressor
+        df: Training data DataFrame
+        weight_scheme: Weight scheme used during fitting
+
+    Returns:
+        dict with template, fitted expression, parameters, χ²/dof,
+        or None if refitting is not applicable / fails.
+    """
+    X, y, _, _ = prepare_features(df, weight_scheme)
+    sigma = df['c2_std'].values
+
+    # Get best equation as SymPy expression
+    try:
+        sympy_expr = model.sympy()
+    except Exception as e:
+        print(f"Could not extract SymPy expression: {e}")
+        return None
+
+    # Find floating-point constants (these are PySR's optimized values)
+    float_atoms = sorted(sympy_expr.atoms(sp.Float), key=lambda x: float(x))
+
+    if not float_atoms:
+        print(f"\nNo float constants to refit. Expression: {sympy_expr}")
+        return None
+
+    # Replace each constant with a named parameter symbol
+    param_symbols = []
+    initial_values = []
+    expr_template = sympy_expr
+    for i, f_val in enumerate(float_atoms):
+        p = sp.Symbol(f'c{i}')
+        expr_template = expr_template.subs(f_val, p)
+        param_symbols.append(p)
+        initial_values.append(float(f_val))
+
+    # Build callable: f(X_array, c0, c1, ...)
+    feat_syms = [sp.Symbol(name) for name in X.columns]
+    f_numeric = sp.lambdify(
+        feat_syms + param_symbols, expr_template, modules='numpy'
+    )
+
+    def model_func(X_arr, *params):
+        cols = [X_arr[:, i] for i in range(X_arr.shape[1])]
+        return f_numeric(*cols, *params)
+
+    # χ² minimization via weighted least-squares
+    try:
+        popt, pcov = curve_fit(
+            model_func, X.values, y,
+            p0=initial_values,
+            sigma=sigma,
+            absolute_sigma=True,
+        )
+        perr = np.sqrt(np.diag(pcov))
+    except Exception as e:
+        print(f"\nCurve fitting failed: {e}")
+        return None
+
+    # Goodness of fit
+    y_pred = model_func(X.values, *popt)
+    chi2 = np.sum(((y - y_pred) / sigma) ** 2)
+    dof = len(y) - len(popt)
+    chi2_dof = chi2 / dof if dof > 0 else float('inf')
+
+    # Identify nearest rationals and build clean expression
+    print("\n" + "=" * 70)
+    print("CONSTANT REFITTING (χ² minimization)")
+    print("=" * 70)
+    print(f"\nTemplate:  {expr_template}")
+    print(f"\nFitted constants:")
+
+    expr_rational = expr_template
+    param_results = {}
+    for p_sym, val, err in zip(param_symbols, popt, perr):
+        frac = Fraction(val).limit_denominator(20)
+        rat = sp.Rational(frac.numerator, frac.denominator)
+        expr_rational = expr_rational.subs(p_sym, rat)
+        param_results[str(p_sym)] = {
+            'value': val, 'error': err, 'rational': str(frac),
+        }
+        print(f"  {p_sym} = {val:.6f} ± {err:.6f}  →  {frac}")
+
+    expr_rational = sp.simplify(expr_rational)
+
+    print(f"\nχ²/dof = {chi2_dof:.3f}  (χ² = {chi2:.1f}, dof = {dof})")
+    print(f"\nRational formula:  {expr_rational}")
+    print(f"LaTeX:  ${sp.latex(expr_rational)}$")
+
+    return {
+        'template': expr_template,
+        'fitted_expr': expr_rational,
+        'params': param_results,
+        'chi2': chi2,
+        'dof': dof,
+        'chi2_dof': chi2_dof,
+    }
+
+
+# =============================================================================
 # Visualization
 # =============================================================================
 
@@ -308,7 +422,8 @@ def plot_results(
     model: PySRRegressor,
     df: pd.DataFrame,
     range_name: str = None,
-    weight_scheme: str = None
+    weight_scheme: str = None,
+    refit_result: dict = None
 ):
     """Create visualization for SR results, organized by temperature.
 
@@ -328,7 +443,15 @@ def plot_results(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     X, y, weights, feature_names = prepare_features(df)
-    y_pred = model.predict(X)
+
+    # Use refitted rational formula for predictions if available
+    if refit_result is not None and 'fitted_expr' in refit_result:
+        feat_syms = [sp.Symbol(name) for name in X.columns]
+        f_rational = sp.lambdify(feat_syms, refit_result['fitted_expr'], modules='numpy')
+        y_pred = f_rational(*[X[col].values for col in X.columns])
+    else:
+        y_pred = model.predict(X)
+
     df = df.copy()
     df['y_pred'] = y_pred
 
@@ -408,15 +531,32 @@ def plot_results(
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
 
-    # Add best equation as suptitle
-    best_eq = model.get_best()
-    range_label = f" [{range_name}]" if range_name else ""
-    weight_label = f" (w={weight_scheme})" if weight_scheme else ""
-    fig.suptitle(f"Best{range_label}{weight_label}: {best_eq['equation']}", fontsize=9, y=1.01)
+    # Add equation as suptitle (prefer refitted rational formula)
+    if refit_result is not None and 'fitted_expr' in refit_result:
+        # Display rational formula: substitute Npart→N for cleaner display
+        display_expr = refit_result['fitted_expr'].subs(
+            sp.Symbol('Npart'), sp.Symbol('N')
+        )
+        rational_latex = sp.latex(display_expr)
+        chi2_str = rf"$\chi^2$/dof = {refit_result['chi2_dof']:.2f}"
+        fig.suptitle(
+            rf"$c_2\{{2\}} = {rational_latex}$  ({chi2_str})",
+            fontsize=10, y=1.02
+        )
+    else:
+        best_eq = model.get_best()
+        range_label = f" [{range_name}]" if range_name else ""
+        weight_label = f" (w={weight_scheme})" if weight_scheme else ""
+        fig.suptitle(
+            f"Best{range_label}{weight_label}: {best_eq['equation']}",
+            fontsize=9, y=1.01
+        )
 
     fig.tight_layout()
     file_suffix = f"_{range_name}" if range_name else ""
     file_suffix += f"_w{weight_scheme}" if weight_scheme else ""
+    if refit_result is not None:
+        file_suffix += "_refitted"
     output_path = OUTPUT_DIR / f"sr_results{file_suffix}.png"
     fig.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to {output_path}")
@@ -531,7 +671,17 @@ def main():
         )
 
         if model is not None:
-            plot_results(model, df, range_name=range_name, weight_scheme=weight_scheme)
+            # Plot 1: Original PySR equation
+            plot_results(model, df, range_name=range_name,
+                         weight_scheme=weight_scheme)
+
+            # Stage 2: Refit constants via χ² minimization
+            refit_result = refit_constants(model, df, weight_scheme)
+
+            # Plot 2: Refitted rational formula
+            if refit_result is not None:
+                plot_results(model, df, range_name=range_name,
+                             weight_scheme=weight_scheme, refit_result=refit_result)
 
             print("\n" + "-" * 70)
             print(f"LaTeX equation [{range_name}, w={weight_scheme}]:")
