@@ -11,9 +11,11 @@ Data structure:
     c2 = two-particle correlation between bin_i and bin_j
 
 Usage:
-    python generate_sr_data.py
+    python generate_sr_data.py                    # Fixed PT_BINS
+    python generate_sr_data.py --quantile-bins     # T-dependent quantile bins
 """
 
+import argparse
 import gc
 import numpy as np
 import pandas as pd
@@ -26,7 +28,7 @@ from numpyro_test import run_numpyro_tmc
 
 # Import binned analysis functions
 from analyze_momentum_bins import (
-    assign_bins, calculate_exact_c2_binned,
+    assign_bins, calculate_exact_c2_binned, get_quantile_bin_edges,
     PT_BINS, PT_MIN_CUT, BIN_LABELS
 )
 
@@ -57,7 +59,8 @@ OUTPUT_PATH = OUTPUT_DIR / "sr_training_data.csv"
 # Feature Extraction
 # =============================================================================
 
-def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float) -> list:
+def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float,
+                            bin_edges: list = None) -> list:
     """
     Extract physics-motivated features for each bin combination.
 
@@ -71,10 +74,14 @@ def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float) ->
         py: Array of shape (n_samples, N) - y-component of momenta
         N: Number of particles
         T: Temperature parameter
+        bin_edges: pT bin boundaries (default: PT_BINS)
 
     Returns:
         List of dictionaries, one per bin combination
     """
+    if bin_edges is None:
+        bin_edges = PT_BINS
+
     n_samples = px.shape[0]
 
     # Calculate pT and phi
@@ -82,7 +89,7 @@ def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float) ->
     phi = np.arctan2(py, px)
 
     # Assign bins (returns -1 for excluded particles)
-    bin_idx = assign_bins(pT, PT_BINS)
+    bin_idx = assign_bins(pT, bin_edges)
 
     # Pre-compute trig functions
     cos2phi = np.cos(2 * phi)
@@ -93,7 +100,7 @@ def extract_binned_features(px: np.ndarray, py: np.ndarray, N: int, T: float) ->
 
     # Bin edge lookup for exact theory calculation
     bin_edges_dict = {
-        BIN_LABELS[k]: (PT_BINS[k], PT_BINS[k+1])
+        BIN_LABELS[k]: (bin_edges[k], bin_edges[k+1])
         for k in range(len(BIN_LABELS))
     }
 
@@ -269,15 +276,43 @@ def clear_memory():
 
 def main():
     """Generate SR training data for all T and N combinations."""
+    parser = argparse.ArgumentParser(
+        description='Generate SR training data for TMC c2{2} correlation.'
+    )
+    parser.add_argument(
+        '--quantile-bins', action='store_true',
+        help='Use T-dependent quantile bin edges instead of fixed PT_BINS'
+    )
+    parser.add_argument(
+        '--output', type=str, default=None,
+        help='Output CSV path (default: data/sr_training_data.csv, '
+             'or data/sr_training_data_quantile.csv with --quantile-bins)'
+    )
+    args = parser.parse_args()
+
+    # Determine output path
+    if args.output is not None:
+        output_path = Path(args.output)
+    elif args.quantile_bins:
+        output_path = OUTPUT_DIR / "sr_training_data_quantile.csv"
+    else:
+        output_path = OUTPUT_PATH
+
     print("=" * 70)
     print("Symbolic Regression Data Generation for TMC c2{2}")
     print("=" * 70)
     print(f"T values: {T_VALUES} GeV")
     print(f"N range: [{min(N_RANGE)}, {max(N_RANGE)}], step {N_RANGE.step}")
     print(f"Minimum pT cut: {PT_MIN_CUT} GeV")
-    print(f"pT bins: {PT_BINS} -> {BIN_LABELS}")
+    if args.quantile_bins:
+        print(f"pT bins: quantile (T-dependent) -> {BIN_LABELS}")
+        for T in T_VALUES:
+            edges = get_quantile_bin_edges(T)
+            print(f"  T={T:.2f}: {[f'{e:.4f}' if np.isfinite(e) else 'inf' for e in edges]}")
+    else:
+        print(f"pT bins: {PT_BINS} -> {BIN_LABELS}")
     print(f"Samples per (T,N): {DRAWS} draws x {CHAINS} chains = {DRAWS * CHAINS}")
-    print(f"Output: {OUTPUT_PATH}")
+    print(f"Output: {output_path}")
     print(f"Checkpoint every: {SAVE_EVERY} runs")
     print("-" * 70)
 
@@ -305,6 +340,9 @@ def main():
     for T in T_VALUES:
         print(f"\n[T = {T:.2f} GeV]")
 
+        # Compute bin edges for this temperature
+        bin_edges = get_quantile_bin_edges(T) if args.quantile_bins else None
+
         for N in N_RANGE:
             run_idx += 1
             progress = f"[{run_idx}/{total_runs}]"
@@ -325,7 +363,8 @@ def main():
             )
 
             # Extract binned features
-            binned_features = extract_binned_features(px, py, N, T)
+            binned_features = extract_binned_features(px, py, N, T,
+                                                      bin_edges=bin_edges)
             results.extend(binned_features)
             runs_since_save += 1
 
@@ -345,7 +384,7 @@ def main():
 
     # Final save
     df = pd.DataFrame(results)
-    df.to_csv(OUTPUT_PATH, index=False)
+    df.to_csv(output_path, index=False)
 
     # Remove checkpoint after successful completion
     if checkpoint_path.exists():
@@ -353,7 +392,7 @@ def main():
         print("\n[Checkpoint removed after successful completion]")
 
     print("\n" + "-" * 70)
-    print(f"Saved {len(results)} data points to {OUTPUT_PATH}")
+    print(f"Saved {len(results)} data points to {output_path}")
 
     # Summary
     print("\n" + "=" * 70)

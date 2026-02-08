@@ -34,7 +34,22 @@ from fractions import Fraction
 BIN_RANK = {'low': 1, 'mid': 2, 'high': 3}
 
 # Weight schemes for SR
-WEIGHT_SCHEMES = ['none', 'variance', 'bin_rank', 'bin_rank_variance']
+WEIGHT_SCHEMES = ['none', 'variance', 'bin_rank', 'bin_rank_variance', 'inv_target']
+
+# Loss types for SR
+LOSS_TYPES = ['mse', 'relative', 'log_scatter']
+
+
+def get_c2_largeN(df: pd.DataFrame) -> np.ndarray:
+    """
+    Compute large-N approximation: c2 = r1·r2 / (2·(N-2)²).
+
+    Used as normalization factor for Strategy B (asymptotic normalization).
+    """
+    r1 = df['mean_p1_sq'].values / df['mean_p2_F'].values
+    r2 = df['mean_p2_sq'].values / df['mean_p2_F'].values
+    N = df['N'].values.astype(float)
+    return r1 * r2 / (2 * (N - 2)**2)
 
 # Plotting style
 try:
@@ -57,48 +72,85 @@ EQUATIONS_FILE = Path("sr_equations.csv")
 # PySR Model Configuration
 # =============================================================================
 
-def create_pysr_model(niterations: int = 100, timeout: int = 3600) -> PySRRegressor:
+def create_pysr_model(niterations: int = 100, timeout: int = 3600,
+                      loss_type: str = 'mse',
+                      log_transform: bool = False) -> PySRRegressor:
     """
     Create PySR model with physics-appropriate configuration.
 
-    Operator Selection Rationale:
+    Operator Selection Rationale (original space):
     - Binary: +, -, *, / needed for physics formulas
     - Unary: square (p^2), inv (1/N terms) are physics-motivated
+
+    In log-log space (log_transform=True), operators are restricted:
+    - Binary: +, - (= multiply/divide in original), * (= exponentiation)
+    - No /, square, inv — these produce nonsensical combinations like r1^log(r2)
+
+    Args:
+        niterations: Number of PySR iterations
+        timeout: Timeout in seconds
+        loss_type: Loss function for optimization:
+            - 'mse': Standard mean squared error (default)
+            - 'relative': (pred - target)² / target² — equal relative error weight
+            - 'log_scatter': |log(pred/target)| — log-scale distance metric
+        log_transform: If True, use restricted operator set for log-log space
     """
+    # Custom loss functions (domain-agnostic dynamic range handling)
+    loss_kwargs = {}
+    if loss_type == 'relative':
+        loss_kwargs['elementwise_loss'] = (
+            "loss(prediction, target, weight) = "
+            "weight * (prediction - target)^2 / (target^2 + 1e-8)"
+        )
+    elif loss_type == 'log_scatter':
+        # Data is pre-filtered to c2 > 0, so use simple log-ratio loss
+        loss_kwargs['elementwise_loss'] = (
+            "loss(prediction, target, weight) = "
+            "weight * abs(log((abs(prediction) + 1e-20) / target))"
+        )
+
+    # Operator set depends on whether we're in log-log space
+    if log_transform:
+        # Log-log space: + = multiply, - = divide, * = power (constant scaling)
+        # No /, square, inv — they produce nonsensical log(x)·log(y) type terms
+        binary_ops = ["+", "-", "*"]
+        unary_ops = []
+        op_complexity = {"+": 1, "-": 1, "*": 1}
+        nested = {}
+    else:
+        # Original space: full physics-motivated operator set
+        binary_ops = ["+", "-", "*", "/"]
+        unary_ops = ["square", "inv(x) = 1/x"]
+        op_complexity = {
+            "+": 1, "-": 1, "*": 1, "/": 1,
+            "square": 1, "inv": 2,
+        }
+        nested = {
+            "inv": {"inv": 0},
+            "square": {"square": 0, "inv": 1},
+        }
+
     model = PySRRegressor(
         # --- Core search parameters ---
         niterations=niterations,
-        populations=16,
-        population_size=40,
+        populations=24,
+        population_size=50,
 
         # --- Complexity control ---
-        maxsize=20,
-        maxdepth=6,
+        maxsize=25,
+        maxdepth=8,
 
-        # --- Operators (physics-motivated) ---
-        binary_operators=["+", "-", "*", "/"],
-        unary_operators=[
-            "square",             # x^2 - common in physics
-            "inv(x) = 1/x",       # 1/x - for 1/(N-2)^2 terms
-        ],
+        # --- Operators ---
+        binary_operators=binary_ops,
+        unary_operators=unary_ops,
 
         # --- Operator complexity penalties ---
-        complexity_of_operators={
-            "+": 1,
-            "-": 1,
-            "*": 1,
-            "/": 2,
-            "square": 3,
-            "inv": 3,
-        },
-        complexity_of_constants=2,
+        complexity_of_operators=op_complexity,
+        complexity_of_constants=1,
         complexity_of_variables=1,
 
         # --- Constraints to guide search ---
-        nested_constraints={
-            "inv": {"inv": 0},
-            "square": {"square": 0, "inv": 1},
-        },
+        nested_constraints=nested,
 
         # --- Output settings ---
         temp_equation_file=str(EQUATIONS_FILE),
@@ -117,17 +169,20 @@ def create_pysr_model(niterations: int = 100, timeout: int = 3600) -> PySRRegres
         # --- Early stopping ---
         timeout_in_seconds=timeout,
 
+        # --- Performance ---
+        turbo=True,
+
         # --- Extra SymPy mappings ---
         extra_sympy_mappings={
             "inv": lambda x: 1/x,
         },
 
-        # --- Reproducibility ---
+        # --- Runtime ---
         random_state=42,
-        deterministic=True,
+        parallelism='multithreading',
 
-        # --- Runtime (deterministic requires serial) ---
-        parallelism='serial',
+        # --- Custom loss function ---
+        **loss_kwargs,
     )
     return model
 
@@ -136,7 +191,8 @@ def create_pysr_model(niterations: int = 100, timeout: int = 3600) -> PySRRegres
 # Feature Preparation
 # =============================================================================
 
-def prepare_features(df: pd.DataFrame, weight_scheme: str = 'bin_rank_variance') -> tuple:
+def prepare_features(df: pd.DataFrame, weight_scheme: str = 'bin_rank_variance',
+                     log_transform: bool = False) -> tuple:
     """
     Prepare feature matrix X and target y from binned data.
 
@@ -148,9 +204,16 @@ def prepare_features(df: pd.DataFrame, weight_scheme: str = 'bin_rank_variance')
     Non-dimensionalization ensures SR discovers formulas with integer/rational
     constants. The target large-N formula becomes: c2 = r1·r2 / (2·(Npart-2)²).
 
+    When log_transform=True, both features and target are log-transformed:
+        - log_r1, log_r2, log_Npart → power-law relationships become linear
+        - log(c2) → compresses 6+ decade dynamic range to ~7 unit range
+        - Standard MSE in log-log space treats all scales equally
+        - Requires c2 > 0 (caller must pre-filter)
+
     Args:
         df: Input dataframe
         weight_scheme: One of 'none', 'variance', 'bin_rank', 'bin_rank_variance'
+        log_transform: If True, apply log transform to features and target
 
     Returns:
         X: DataFrame with features (keeps column names for PySR)
@@ -159,15 +222,27 @@ def prepare_features(df: pd.DataFrame, weight_scheme: str = 'bin_rank_variance')
         feature_names: List of feature names
     """
     # Non-dimensionalized features for clean integer/rational SR constants
-    # Dividing by <p²>_F makes momentum features dimensionless and O(1)
-    # N is kept as-is: SR must discover the (N-2) shift itself
-    X = pd.DataFrame({
-        'r1': df['mean_p1_sq'] / df['mean_p2_F'],   # <p1²>/<p²>_F (dimensionless)
-        'r2': df['mean_p2_sq'] / df['mean_p2_F'],   # <p2²>/<p²>_F (dimensionless)
-        'Npart': df['N'].astype(float),              # multiplicity (unreduced)
-    })
+    r1 = df['mean_p1_sq'] / df['mean_p2_F']
+    r2 = df['mean_p2_sq'] / df['mean_p2_F']
+    Npart = df['N'].astype(float)
+
+    if log_transform:
+        X = pd.DataFrame({
+            'log_r1': np.log(r1),
+            'log_r2': np.log(r2),
+            'log_Npart': np.log(Npart),
+            'inv_N': 1.0 / Npart,       # correction for log(N-2) ≈ log(N) - 2/N
+        })
+        y = np.log(df['c2_mean'].values)
+    else:
+        X = pd.DataFrame({
+            'r1': r1,
+            'r2': r2,
+            'Npart': Npart,
+        })
+        y = df['c2_mean'].values
+
     feature_names = list(X.columns)
-    y = df['c2_mean'].values
 
     # Calculate weights based on scheme
     if weight_scheme == 'none':
@@ -187,6 +262,10 @@ def prepare_features(df: pd.DataFrame, weight_scheme: str = 'bin_rank_variance')
         w_bin = bin_i_rank * bin_j_rank
         w_var = 1.0 / (df['c2_std'].values**2 + 1e-12)
         weights = w_bin * w_var
+    elif weight_scheme == 'inv_target':
+        # Inverse target squared: w = 1/y² → weighted MSE = relative squared error
+        # Equivalent to relative loss but uses PySR's native BFGS optimization
+        weights = 1.0 / (y**2 + 1e-12)
     else:
         raise ValueError(f"Unknown weight_scheme: {weight_scheme}")
 
@@ -222,7 +301,9 @@ def run_symbolic_regression(
     data_path: Path,
     n_range: tuple = None,
     range_name: str = None,
-    weight_scheme: str = 'bin_rank_variance'
+    weight_scheme: str = 'bin_rank_variance',
+    loss_type: str = 'mse',
+    log_transform: bool = False
 ) -> tuple:
     """Run symbolic regression on binned data.
 
@@ -231,6 +312,8 @@ def run_symbolic_regression(
         n_range: Optional tuple (min_N, max_N) to filter data. None means no limit.
         range_name: Optional name for this N range (for output naming)
         weight_scheme: One of 'none', 'variance', 'bin_rank', 'bin_rank_variance'
+        loss_type: Loss function type ('mse', 'relative', 'log_scatter')
+        log_transform: If True, work in log-log space (log features + log target)
 
     Returns:
         (model, df, range_name, weight_scheme) tuple
@@ -239,6 +322,9 @@ def run_symbolic_regression(
     print("=" * 70)
     print(f"Symbolic Regression for TMC c2{{2}}{range_suffix}")
     print(f"Weight scheme: {weight_scheme}")
+    print(f"Loss type: {loss_type}")
+    if log_transform:
+        print("Log-log transform: ENABLED")
     print("=" * 70)
 
     # Load data
@@ -257,18 +343,31 @@ def run_symbolic_regression(
         range_str = f"{n_min if n_min else ''} <= N <= {n_max if n_max else ''}"
         print(f"Filtered to {len(df)} data points with {range_str}")
 
+    # Filter non-positive c2 when log transform or log_scatter is used
+    if log_transform or loss_type == 'log_scatter':
+        pos_mask = df['c2_mean'].values > 0
+        n_removed = (~pos_mask).sum()
+        if n_removed > 0:
+            df = df[pos_mask].reset_index(drop=True)
+            label = "log-transform" if log_transform else "log_scatter"
+            print(f"  [{label}] Filtered {n_removed} non-positive c2 points "
+                  f"({len(df)} remaining)")
+
     # Show data summary
     T_values = df['T'].unique()
     print(f"Temperature values: {sorted(T_values)} GeV")
     print(f"Bin combinations: {df[['bin_i', 'bin_j']].drop_duplicates().values.tolist()}")
 
-    # Prepare features with specified weight scheme
-    X, y, weights, feature_names = prepare_features(df, weight_scheme=weight_scheme)
+    # Prepare features
+    X, y, weights, feature_names = prepare_features(
+        df, weight_scheme=weight_scheme, log_transform=log_transform
+    )
     print(f"\nFeatures: {feature_names}")
-    print(f"Target: c2_mean (range: [{y.min():.6f}, {y.max():.6f}])")
+    target_label = "log(c2_mean)" if log_transform else "c2_mean"
+    print(f"Target: {target_label} (range: [{y.min():.4f}, {y.max():.4f}])")
 
-    # Create and fit model
-    model = create_pysr_model()
+    # Create and fit model (loss_type determines optimization objective)
+    model = create_pysr_model(loss_type=loss_type, log_transform=log_transform)
 
     print("\n" + "=" * 70)
     print("Starting PySR search...")
@@ -290,10 +389,14 @@ def run_symbolic_regression(
     print(f"  Loss: {best_eq['loss']:.2e}")
     print(f"  Complexity: {best_eq['complexity']}")
 
-    # Save equations with range and weight scheme in filename
+    # Save equations with range, weight scheme, and loss type in filename
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     file_suffix = f"_{range_name}" if range_name else ""
     file_suffix += f"_w{weight_scheme}"
+    if log_transform:
+        file_suffix += "_log"
+    if loss_type != 'mse':
+        file_suffix += f"_L{loss_type}"
     output_file = OUTPUT_DIR / f"sr_pareto_front{file_suffix}.csv"
     if hasattr(model, 'equations_') and model.equations_ is not None:
         model.equations_.to_csv(output_file, index=False)
@@ -423,7 +526,9 @@ def plot_results(
     df: pd.DataFrame,
     range_name: str = None,
     weight_scheme: str = None,
-    refit_result: dict = None
+    refit_result: dict = None,
+    loss_type: str = 'mse',
+    log_transform: bool = False
 ):
     """Create visualization for SR results, organized by temperature.
 
@@ -436,13 +541,19 @@ def plot_results(
         df: Data used for training
         range_name: Optional name for N range (for output naming)
         weight_scheme: Weight scheme used (for output naming)
+        refit_result: Optional refitted constants result
+        loss_type: Loss function used (for output naming)
+        log_transform: If True, model was trained in log space — convert back
     """
     if model is None or df is None:
         return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    X, y, weights, feature_names = prepare_features(df)
+    # Get features in the same space the model was trained in
+    X, y, weights, feature_names = prepare_features(
+        df, log_transform=log_transform
+    )
 
     # Use refitted rational formula for predictions if available
     if refit_result is not None and 'fitted_expr' in refit_result:
@@ -451,6 +562,10 @@ def plot_results(
         y_pred = f_rational(*[X[col].values for col in X.columns])
     else:
         y_pred = model.predict(X)
+
+    # Convert from log space back to original space for plotting
+    if log_transform:
+        y_pred = np.exp(y_pred)
 
     df = df.copy()
     df['y_pred'] = y_pred
@@ -547,14 +662,22 @@ def plot_results(
         best_eq = model.get_best()
         range_label = f" [{range_name}]" if range_name else ""
         weight_label = f" (w={weight_scheme})" if weight_scheme else ""
+        loss_label = f" [L={loss_type}]" if loss_type != 'mse' else ""
+        log_label = " [log]" if log_transform else ""
+        eq_prefix = "log(c2) = " if log_transform else ""
         fig.suptitle(
-            f"Best{range_label}{weight_label}: {best_eq['equation']}",
+            f"Best{range_label}{weight_label}{loss_label}{log_label}: "
+            f"{eq_prefix}{best_eq['equation']}",
             fontsize=9, y=1.01
         )
 
     fig.tight_layout()
     file_suffix = f"_{range_name}" if range_name else ""
     file_suffix += f"_w{weight_scheme}" if weight_scheme else ""
+    if log_transform:
+        file_suffix += "_log"
+    if loss_type != 'mse':
+        file_suffix += f"_L{loss_type}"
     if refit_result is not None:
         file_suffix += "_refitted"
     output_path = OUTPUT_DIR / f"sr_results{file_suffix}.png"
@@ -579,13 +702,21 @@ Examples:
   python run_sr.py --n-min 50                 # N >= 50 (no upper bound)
   python run_sr.py                            # All data (no N filtering)
   python run_sr.py --n-min 10 --n-max 70 --weight bin_rank  # Custom range + single weight
+  python run_sr.py --log -w none              # Log-log transform (recommended for dynamic range)
+  python run_sr.py --log -w bin_rank          # Log-log transform + bin_rank weighting
 
 Available weight schemes:
   none              : No weighting (uniform)
   variance          : 1/c2_std² (inverse variance)
   bin_rank          : bin_i_rank × bin_j_rank (high=3, mid=2, low=1)
   bin_rank_variance : bin_rank × inverse_variance (combined)
+  inv_target        : 1/c2² — scale-invariant (native BFGS, not custom loss)
   all               : Run all weight schemes (default)
+
+Log-log transform (--log):
+  Transforms features and target to log space before SR.
+  In log-log space, power-law relationships (c2 ~ r1·r2/N²) become linear,
+  and MSE treats all scales equally. Domain-agnostic — no physics knowledge assumed.
         """
     )
     parser.add_argument(
@@ -606,6 +737,20 @@ Available weight schemes:
         default='all',
         choices=WEIGHT_SCHEMES + ['all'],
         help='Weight scheme to use (default: all)'
+    )
+    parser.add_argument(
+        '--loss', '-l',
+        type=str,
+        default='mse',
+        choices=LOSS_TYPES,
+        help='Loss function: mse (default), relative, or log_scatter'
+    )
+    parser.add_argument(
+        '--log',
+        action='store_true',
+        default=False,
+        help='Log-log transform: log(features) + log(c2) target with standard MSE. '
+             'Compresses dynamic range so PySR treats all N scales equally.'
     )
     return parser.parse_args()
 
@@ -647,8 +792,15 @@ def main():
     print("=" * 70)
     print(f"pT bins: {PT_BINS} -> {BIN_LABELS}")
     print(f"Data: {DATA_PATH}")
+    loss_type = args.loss
+
+    log_transform = args.log
+
     print(f"N range: {n_range_str}")
     print(f"Weight schemes: {weights_to_run}")
+    print(f"Loss type: {loss_type}")
+    if log_transform:
+        print(f"Log-log transform: ENABLED")
     print("=" * 70 + "\n")
 
     results = {}
@@ -667,21 +819,28 @@ def main():
             DATA_PATH,
             n_range=n_range if has_n_filter else None,
             range_name=range_name,
-            weight_scheme=weight_scheme
+            weight_scheme=weight_scheme,
+            loss_type=loss_type,
+            log_transform=log_transform
         )
 
         if model is not None:
             # Plot 1: Original PySR equation
             plot_results(model, df, range_name=range_name,
-                         weight_scheme=weight_scheme)
+                         weight_scheme=weight_scheme, loss_type=loss_type,
+                         log_transform=log_transform)
 
             # Stage 2: Refit constants via χ² minimization
-            refit_result = refit_constants(model, df, weight_scheme)
+            # (skip refit for log-transform mode — formulas are in log space)
+            if not log_transform:
+                refit_result = refit_constants(model, df, weight_scheme)
 
-            # Plot 2: Refitted rational formula
-            if refit_result is not None:
-                plot_results(model, df, range_name=range_name,
-                             weight_scheme=weight_scheme, refit_result=refit_result)
+                # Plot 2: Refitted rational formula
+                if refit_result is not None:
+                    plot_results(model, df, range_name=range_name,
+                                 weight_scheme=weight_scheme,
+                                 refit_result=refit_result,
+                                 loss_type=loss_type)
 
             print("\n" + "-" * 70)
             print(f"LaTeX equation [{range_name}, w={weight_scheme}]:")
@@ -699,7 +858,12 @@ def main():
     for (range_name, weight_scheme), model in results.items():
         best_eq = model.get_best()
         print(f"\n{range_name} (w={weight_scheme}):")
-        print(f"  Equation: {best_eq['equation']}")
+        eq_str = best_eq['equation']
+        if log_transform:
+            print(f"  log(c2) = {eq_str}")
+            print(f"  → c2 = exp({eq_str})")
+        else:
+            print(f"  Equation: {eq_str}")
         print(f"  Loss: {best_eq['loss']:.2e}")
 
     print("\n" + "=" * 70)

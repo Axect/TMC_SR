@@ -39,6 +39,39 @@ FIG_DIR = Path("figs")
 # Utility Functions (used by generate_sr_data.py)
 # =============================================================================
 
+def get_quantile_bin_edges(T: float, n_bins: int = 3,
+                           pt_min: float = PT_MIN_CUT) -> list:
+    """
+    Compute T-dependent bin edges using equal-probability quantiles of the
+    truncated Boltzmann distribution (p >= pt_min).
+
+    The momentum distribution is Gamma(k=2, scale=T). We condition on
+    p >= pt_min and split the remaining probability mass into n_bins
+    equal slices.
+
+    Args:
+        T: Temperature (GeV)
+        n_bins: Number of bins (default 3)
+        pt_min: Minimum pT cut (GeV)
+
+    Returns:
+        List of n_bins+1 bin edges, e.g. [pt_min, q1, q2, inf]
+    """
+    from scipy.stats import gamma as gamma_dist
+
+    dist = gamma_dist(a=2, scale=T)
+    F_min = dist.cdf(pt_min)
+
+    edges = [pt_min]
+    for k in range(1, n_bins):
+        # k-th quantile of the truncated distribution
+        F_k = F_min + k / n_bins * (1.0 - F_min)
+        edges.append(dist.ppf(F_k))
+    edges.append(np.inf)
+
+    return edges
+
+
 def assign_bins(pT: np.ndarray, bin_edges: list) -> np.ndarray:
     """
     Assign particles to pT bins.
